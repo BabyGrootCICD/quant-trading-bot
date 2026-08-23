@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  paper-trader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    restart: unless-stopped
+    volumes:
+      - ../logs:/app/logs
+
+  quantum-optimizer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.quantum
+    env_file:
+      - ../.env
+    restart: "no"
+    volumes:
+      - ../logs:/app/logs
+
+  data-fetcher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m src.data.fetcher
+    env_file:
+      - ../.env
+    restart: "no"
+
+  feature-engineer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m src.features.engineer
+    env_file:
+      - ../.env
+    restart: "no"
+
+  model-trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m src.models.trainer
+    env_file:
+      - ../.env
+    restart: "no"
+
+networks:
+  default:
+    name: quant-bot-network

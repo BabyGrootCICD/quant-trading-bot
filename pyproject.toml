@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-trading-bot"
+version = "0.1.0"
+description = "Hourly crypto trading bot with ML and quantum optimization"
+readme = "README.md"
+authors = [{name = "Dennis Lee", email = "dennis@example.com"}]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.0.0",
+    "supabase>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "xgboost>=2.0.0",
+    "ta>=0.11.0",
+    "qiskit>=0.45",
+    "qiskit-finance>=0.4.1",
+    "qiskit-algorithms>=0.2.0",
+    "qiskit-optimization>=0.6.0",
+    "qiskit-machine-learning>=0.7.0",
+    "qiskit-ibm-runtime>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+quant-bot = "src.paper_trading.engine:main"
+quant-train = "src.models.trainer:main"
+quant-fetch = "src.data.fetcher:main"
+quant-features = "src.features.engineer:main"
+quant-quantum = "src.quantum.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "W", "UP", "B", "C4", "ARG", "PL", "PTH", "TRY", "SIM", "TID", "RSE", "PERF", "PIE"]
+ignore = ["E501", "B008", "C901"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
