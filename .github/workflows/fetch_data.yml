@@ -27,6 +27,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EXCHANGE_ID: binanceus
 
       - name: Compute features
         run: python -m src.features.engineer

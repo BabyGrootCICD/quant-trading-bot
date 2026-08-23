@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from config.settings import SYMBOLS
+from config.settings import SYMBOLS, EXCHANGE_ID
 from src.data.supabase_client import get_client
 from src.strategy.signals import generate_signals
 from src.strategy.sizing import calculate_position_size
@@ -18,11 +18,14 @@ TAKER_FEE = 0.001
 SLIPPAGE_BPS = 5
 
 
-def create_exchange() -> ccxt.binance:
-    return ccxt.binance({"enableRateLimit": True})
+def create_exchange():
+    exchange_class = getattr(ccxt, EXCHANGE_ID, None)
+    if exchange_class is None:
+        raise ValueError(f"Unknown exchange: {EXCHANGE_ID}")
+    return exchange_class({"enableRateLimit": True})
 
 
-def fetch_live_prices(exchange: ccxt.binance, symbols: list[str]) -> dict[str, float]:
+def fetch_live_prices(exchange, symbols: list[str]) -> dict[str, float]:
     prices = {}
     for symbol in symbols:
         try:

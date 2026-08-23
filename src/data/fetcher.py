@@ -8,15 +8,18 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from config.settings import SYMBOLS, TIMEFRAME, HISTORY_YEARS
+from config.settings import SYMBOLS, TIMEFRAME, HISTORY_YEARS, EXCHANGE_ID
 from src.data.supabase_client import get_client
 
 
-def create_exchange() -> ccxt.binance:
-    return ccxt.binance({"enableRateLimit": True})
+def create_exchange():
+    exchange_class = getattr(ccxt, EXCHANGE_ID, None)
+    if exchange_class is None:
+        raise ValueError(f"Unknown exchange: {EXCHANGE_ID}")
+    return exchange_class({"enableRateLimit": True})
 
 
-def fetch_ohlcv_all(exchange: ccxt.binance, symbol: str, timeframe: str, since_ms: int) -> list[list]:
+def fetch_ohlcv_all(exchange, symbol: str, timeframe: str, since_ms: int) -> list[list]:
     all_candles = []
     while True:
         candles = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=1000)
@@ -57,7 +60,7 @@ def upsert_candles(client, rows: list[dict]) -> int:
     return total
 
 
-def fetch_and_store(exchange: ccxt.binance, client, symbol: str) -> int:
+def fetch_and_store(exchange, client, symbol: str) -> int:
     since = exchange.parse8601(
         (datetime.now(timezone.utc) - timedelta(days=365 * HISTORY_YEARS)).isoformat()
     )
@@ -73,6 +76,7 @@ def fetch_and_store(exchange: ccxt.binance, client, symbol: str) -> int:
 def main():
     print("=" * 60)
     print("Quant Bot - Hourly Data Fetcher")
+    print(f"Exchange: {EXCHANGE_ID}")
     print("=" * 60)
     exchange = create_exchange()
     exchange.load_markets()
