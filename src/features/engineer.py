@@ -11,16 +11,29 @@ from src.data.supabase_client import get_client
 
 
 def fetch_candles(client, symbol: str) -> pd.DataFrame:
-    resp = (
-        client.table("candles")
-        .select("timestamp,open,high,low,close,volume")
-        .eq("symbol", symbol)
-        .order("timestamp", desc=False)
-        .execute()
-    )
-    if not resp.data:
+    all_data = []
+    batch_size = 1000
+    offset = 0
+
+    while True:
+        resp = (
+            client.table("candles")
+            .select("timestamp,open,high,low,close,volume")
+            .eq("symbol", symbol)
+            .order("timestamp", desc=False)
+            .range(offset, offset + batch_size - 1)
+            .execute()
+        )
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < batch_size:
+            break
+        offset += batch_size
+
+    if not all_data:
         return pd.DataFrame()
-    df = pd.DataFrame(resp.data)
+    df = pd.DataFrame(all_data)
     df["timestamp"] = df["timestamp"].astype(int)
     return df
 
