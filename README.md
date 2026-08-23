@@ -27,6 +27,7 @@ Hourly crypto trading bot using ML predictions on BinanceUS, scheduled via GitHu
 | :07 | Fetch Hourly Data | Pull candles, compute features |
 | :12 | Paper Trade | Fetch prices, predict, trade |
 | Sun 3AM | Train Model | Retrain all 8 models |
+| Sun 6AM | Quantum Optimization | Portfolio opt, risk analysis, kernel comparison |
 
 ## Quick Start
 
@@ -37,6 +38,7 @@ python -m src.paper_trading.engine
 # Manual trigger
 gh workflow run "Paper Trade (Hourly)"
 gh workflow run "Train Model (Weekly)"
+gh workflow run "Quantum Optimization (Weekly)"
 ```
 
 ## Database Tables
@@ -48,9 +50,45 @@ gh workflow run "Train Model (Weekly)"
 - `portfolio` — equity curve, total asset USD, win rate
 - `model_metrics` — training evaluation results
 
+## Quantum Integration
+
+Three quantum modules for when the classical system scales past 50+ assets:
+
+### Portfolio Optimization (QAOA)
+- Selects optimal subset of assets under budget/cardinality constraints
+- Maps mean-variance optimization to QUBO → solves with QAOA
+- Compares quantum vs classical (NumPy exact solver) results
+
+### Monte Carlo Risk Simulation (Amplitude Estimation)
+- Estimates VaR and CVaR across 1000+ simulated price paths
+- Quadratic speedup over classical Monte Carlo
+- Provides worst-case/best-case scenarios
+
+### Pattern Recognition (Quantum Kernel)
+- Quantum SVM for market regime classification
+- Compares quantum kernel vs classical RBF kernel
+- Identifies quantum advantage in high-dimensional feature spaces
+
+### Configuration
+
+Set in GitHub Secrets:
+- `IBM_QUANTUM_TOKEN` — IBM Quantum API key
+- `IBM_QUANTUM_INSTANCE` — IBM Quantum instance CRN
+
+### When to Use Quantum
+
+| Condition | Use Case |
+|-----------|----------|
+| > 50 assets | Portfolio optimization |
+| > 5 hard constraints | QUBO formulation |
+| > 1000 Monte Carlo paths | Amplitude estimation |
+| > 50 features | Quantum kernel methods |
+
 ## Configuration
 
 Set in GitHub Secrets:
 - `SUPABASE_URL` — Your Supabase project URL
 - `SUPABASE_KEY` — Your Supabase anon/service key
 - `EXCHANGE_ID` — Exchange ID (default: `binanceus`)
+- `IBM_QUANTUM_TOKEN` — IBM Quantum API key (optional)
+- `IBM_QUANTUM_INSTANCE` — IBM Quantum instance CRN (optional)
