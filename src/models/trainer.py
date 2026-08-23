@@ -150,14 +150,15 @@ def main():
                     pred = model.predict(latest)
                     if not pred.empty and pred["prediction"].notna().any():
                         row = pred.iloc[0]
-                        client.table("predictions").upsert({
+                        client.table("predictions").delete().eq("symbol", symbol).execute()
+                        client.table("predictions").insert({
                             "symbol": symbol,
                             "timestamp": int(row["timestamp"]),
                             "model_name": active_model_name,
                             "prediction": float(row["prediction"]),
                             "probability_up": float(row["probability_up"]),
                             "confidence": float(row["confidence"]),
-                        }, on_conflict="symbol,timestamp").execute()
+                        }).execute()
                         print(f"  Prediction: P(up)={row['probability_up']:.3f} -> {'LONG' if row['prediction'] == 1 else 'SHORT'}")
             else:
                 print(f"  Skipped: {metrics.get('error')}")
