@@ -1,3 +1,5 @@
+-- Phase 1-3: Core tables for quant trading bot
+
 CREATE TABLE IF NOT EXISTS candles (
     id BIGSERIAL PRIMARY KEY,
     symbol VARCHAR(20) NOT NULL,
@@ -88,3 +90,19 @@ CREATE TABLE IF NOT EXISTS model_metrics (
     win_rate DOUBLE PRECISION,
     avg_pnl_per_trade DOUBLE PRECISION
 );
+
+-- Enable RLS on all tables
+ALTER TABLE candles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE features ENABLE ROW LEVEL SECURITY;
+ALTER TABLE predictions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE paper_trades ENABLE ROW LEVEL SECURITY;
+ALTER TABLE portfolio ENABLE ROW LEVEL SECURITY;
+ALTER TABLE model_metrics ENABLE ROW LEVEL SECURITY;
+
+-- Allow anon full access (for GHA cron jobs using the anon key)
+CREATE POLICY "Allow anon all operations on candles" ON candles FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anon all operations on features" ON features FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anon all operations on predictions" ON predictions FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anon all operations on paper_trades" ON paper_trades FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anon all operations on portfolio" ON portfolio FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow anon all operations on model_metrics" ON model_metrics FOR ALL USING (true) WITH CHECK (true);
