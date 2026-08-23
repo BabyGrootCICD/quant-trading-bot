@@ -1,8 +1,8 @@
-name: Hourly Pipeline (Fetch → Train → Trade)
+name: 5 minutes Pipeline (Fetch → Train → Trade)
 
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 concurrency:
