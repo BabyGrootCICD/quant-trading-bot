@@ -1,4 +1,4 @@
-name: Fetch Hourly Data
+name: Hourly Pipeline (Fetch → Train → Trade)
 
 on:
   schedule:
@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: fetch-data
+  group: hourly-pipeline
   cancel-in-progress: false
 
 jobs:
-  fetch:
+  pipeline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,3 +34,16 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+      - name: Train model
+        run: python -m src.models.trainer
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+      - name: Paper trade
+        run: python -m src.paper_trading.engine
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EXCHANGE_ID: binanceus
