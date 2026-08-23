@@ -16,8 +16,11 @@ def percentage_based_size(
     max_position: float = DEFAULT_MAX_POSITION_USD,
 ) -> float:
     abs_change = abs(estimated_change_pct)
+    if abs_change < 0.0001:  # Minimum change threshold (was 0.001)
+        # Use tanh fallback for very small predicted changes
+        return tanh_size(0.5, max_position)
     if abs_change < 0.001:
-        return 0.0
+        return 0.0  # Too small to trade
     size = min(total_asset_usd * risk_per_trade / abs_change, max_position)
     return max(0.0, size)
 

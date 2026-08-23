@@ -7,8 +7,8 @@ def expected_value(pnl_series: list[float]) -> float:
     return float(np.mean(pnl_series))
 
 
-def sharpe_ratio(returns: list[float], periods_per_year: int = 8760) -> float:
-    if len(returns) < 2:
+def sharpe_ratio(returns: list[float], periods_per_year: int = 8760, min_trades: int = 30) -> float:
+    if len(returns) < min_trades:
         return 0.0
     arr = np.array(returns)
     mean = np.mean(arr)

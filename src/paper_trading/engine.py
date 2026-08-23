@@ -163,6 +163,17 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
 
 def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dict[str, float],
                      trade_history: pd.DataFrame, now_ms: int):
+    # Calculate REAL cash balance
+    realized_pnl = 0.0
+    realized_fees = 0.0
+    if not trade_history.empty and "pnl" in trade_history.columns:
+        realized_pnl = trade_history["pnl"].sum()
+        realized_fees = trade_history["fees"].sum() if "fees" in trade_history.columns else 0.0
+
+    # Cash = initial - capital locked in open positions + realized PnL - fees
+    capital_locked = sum(trade["size"] for _, trade in open_trades.iterrows()) if not open_trades.empty else 0.0
+    cash_balance = cash - capital_locked + realized_pnl - realized_fees
+
     positions_value = 0.0
     if not open_trades.empty:
         for _, trade in open_trades.iterrows():
@@ -178,7 +189,7 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
                 pnl = (entry_price - current_price) / entry_price * size
             positions_value += size + pnl
 
-    equity = cash + positions_value
+    equity = cash_balance + positions_value
     total_asset_usd = equity
 
     closed_pnl = []
@@ -193,7 +204,7 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     client.table("portfolio").insert({
         "timestamp": now_ms,
         "equity": round(equity, 2),
-        "cash": round(cash, 2),
+        "cash": round(cash_balance, 2),
         "positions_value": round(positions_value, 2),
         "total_pnl": round(total_pnl, 2),
         "total_asset_usd": round(total_asset_usd, 2),
@@ -202,7 +213,7 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
         "total_trades": total_trades,
     }).execute()
 
-    return {"equity": equity, "cash": cash, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades, "total_asset_usd": total_asset_usd}
+    return {"equity": equity, "cash": cash_balance, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades, "total_asset_usd": total_asset_usd}
 
 
 def log_predictions(client, signals: pd.DataFrame, model_name: str):
