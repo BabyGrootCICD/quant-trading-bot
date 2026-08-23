@@ -11,11 +11,20 @@ from config.settings import SYMBOLS, EXCHANGE_ID
 from src.data.supabase_client import get_client
 from src.strategy.signals import generate_signals
 from src.strategy.sizing import calculate_position_size
-from src.utils.metrics import sharpe_ratio, win_rate
+from src.utils.metrics import sharpe_ratio, win_rate, trade_returns, annualization_factor
 
 INITIAL_CASH = 10000.0
 TAKER_FEE = 0.001
 SLIPPAGE_BPS = 5
+
+# A prediction older than this is not tradeable. Without this guard the engine
+# happily replayed one frozen prediction set for a full day, paying the
+# round-trip spread every hour on a signal carrying zero information.
+MAX_PREDICTION_AGE_HOURS = 2
+
+# Number of closed trades pulled for portfolio stats. The old 500 cap silently
+# truncated total_pnl and total_trades once the bot passed 500 trades.
+TRADE_HISTORY_LIMIT = 5000
 
 
 def create_exchange():
@@ -62,10 +71,15 @@ def fetch_open_trades(client) -> pd.DataFrame:
     return pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
 
 
-def fetch_trade_history(client, limit: int = 500) -> pd.DataFrame:
+def fetch_trade_history(client, limit: int = TRADE_HISTORY_LIMIT) -> pd.DataFrame:
+    """Closed trades, newest first.
+
+    `size` and `exit_time` are needed to express PnL as a return and to work
+    out the real trade frequency for Sharpe annualization.
+    """
     resp = (
         client.table("paper_trades")
-        .select("pnl,status,actual_pnl_usd")
+        .select("pnl,status,actual_pnl_usd,size,fees,entry_time,exit_time")
         .neq("status", "open")
         .order("created_at", desc=True)
         .limit(limit)
@@ -85,13 +99,64 @@ def fetch_portfolio_history(client, limit: int = 168) -> pd.DataFrame:
     return pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
 
 
-def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, float], now_ms: int):
-    if open_trades.empty:
-        return
+def round_trip_cost(size: float) -> float:
+    """Fee + slippage for a full round trip (entry leg and exit leg).
 
+    The old model charged a single leg, understating the real cost of the
+    hourly churn by half.
+    """
+    per_leg = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
+    return 2 * per_leg
+
+
+def is_prediction_fresh(prediction_ts_ms: int, now_ms: int, max_age_hours: int = MAX_PREDICTION_AGE_HOURS) -> bool:
+    """True when a prediction is recent enough to trade on."""
+    age_hours = (now_ms - int(prediction_ts_ms)) / 3_600_000
+    return 0 <= age_hours <= max_age_hours
+
+
+def desired_sides(signals: pd.DataFrame) -> dict[str, str]:
+    """Map symbol -> desired side for the current (fresh) signal set."""
+    if signals is None or signals.empty:
+        return {}
+    out = {}
+    for _, row in signals.iterrows():
+        if row["signal"] == 1:
+            out[row["symbol"]] = "long"
+        elif row["signal"] == -1:
+            out[row["symbol"]] = "short"
+    return out
+
+
+def desired_sides_from_trades(open_trades: pd.DataFrame) -> dict[str, str]:
+    """Map symbol -> side for currently open positions."""
+    if open_trades is None or open_trades.empty:
+        return {}
+    return {row["symbol"]: row["side"] for _, row in open_trades.iterrows()}
+
+
+def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, float], now_ms: int,
+                         wanted: dict[str, str] | None = None):
+    """Close positions the current signal no longer wants.
+
+    `wanted` maps symbol -> side for the fresh signals. A position whose side
+    still matches is held rather than closed-and-reopened: the old code closed
+    every position every hour and paid the round trip again, which is what
+    turned a zero-information signal into a steady loss.
+
+    Passing `wanted=None` closes everything (used when no fresh signal exists).
+    """
+    if open_trades.empty:
+        return []
+
+    closed_symbols = []
     for _, trade in open_trades.iterrows():
         symbol = trade["symbol"]
         if symbol not in prices:
+            continue
+
+        if wanted is not None and wanted.get(symbol) == trade["side"]:
+            print(f"  Holding {trade['side']} {symbol} (signal unchanged)")
             continue
 
         current_price = prices[symbol]
@@ -104,7 +169,8 @@ def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, fl
         else:
             raw_pnl = (entry_price - current_price) / entry_price * size
 
-        fees = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
+        # Both legs: the position was opened and is now being closed.
+        fees = round_trip_cost(size)
         net_pnl = raw_pnl - fees
         actual_pnl_usd = net_pnl
 
@@ -117,10 +183,15 @@ def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, fl
             "status": "closed",
         }).eq("id", trade["id"]).execute()
 
+        closed_symbols.append(symbol)
         print(f"  Closed {side} {symbol}: entry={entry_price:.2f} exit={current_price:.2f} pnl=${actual_pnl_usd:.2f}")
 
+    return closed_symbols
 
-def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str, total_asset_usd: float):
+
+def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str,
+                       total_asset_usd: float, held: dict[str, str] | None = None):
+    held = held or {}
     if signals.empty:
         return
 
@@ -134,6 +205,12 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
             continue
 
         side = "long" if signal == 1 else "short"
+        if held.get(symbol) == side:
+            # Already positioned this way; re-entering would just pay the
+            # spread again for no change in exposure.
+            print(f"  Skipped {symbol}: already {side}")
+            continue
+
         current_price = prices[symbol]
         estimated_change_pct = row.get("estimated_change_pct", 0.0)
         size = calculate_position_size(
@@ -159,6 +236,42 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
         }).execute()
 
         print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
+
+
+def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float:
+    """Annualized Sharpe over the most recent `window` closed trades.
+
+    Three bugs used to live here:
+      * dollar PnL was fed straight in, so the ratio scaled with position size;
+      * it was annualized at sqrt(8760) as if one trade happened per hour,
+        while the bot opens one per symbol per hour;
+      * `closed_pnl[-168:]` sliced the *oldest* rows, because the query
+        returns newest-first.
+    """
+    if trade_history.empty or "pnl" not in trade_history.columns:
+        return 0.0
+    if "size" not in trade_history.columns:
+        return 0.0
+
+    hist = trade_history.dropna(subset=["pnl", "size"])
+    if hist.empty:
+        return 0.0
+
+    # Newest-first from the query, so the newest `window` rows are the head.
+    recent = hist.head(window)
+
+    rets = trade_returns(recent["pnl"].tolist(), recent["size"].tolist())
+    if len(rets) < 2:
+        return 0.0
+
+    span_hours = 0.0
+    if "exit_time" in recent.columns:
+        times = pd.to_numeric(recent["exit_time"], errors="coerce").dropna()
+        if len(times) >= 2:
+            span_hours = (times.max() - times.min()) / 3_600_000
+
+    ppy = annualization_factor(len(rets), span_hours)
+    return sharpe_ratio(rets, periods_per_year=ppy)
 
 
 def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dict[str, float],
@@ -193,13 +306,16 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     total_asset_usd = equity
 
     closed_pnl = []
+    closed_sizes = []
     if not trade_history.empty and "pnl" in trade_history.columns:
-        closed_pnl = trade_history["pnl"].dropna().tolist()
+        hist = trade_history.dropna(subset=["pnl"])
+        closed_pnl = hist["pnl"].tolist()
+        closed_sizes = hist["size"].tolist() if "size" in hist.columns else []
 
     total_pnl = sum(closed_pnl) if closed_pnl else 0.0
     wr = win_rate(closed_pnl)
     total_trades = len(closed_pnl)
-    sr = sharpe_ratio(closed_pnl[-168:]) if len(closed_pnl) >= 2 else 0.0
+    sr = compute_sharpe(trade_history)
 
     client.table("portfolio").insert({
         "timestamp": now_ms,
@@ -214,23 +330,6 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     }).execute()
 
     return {"equity": equity, "cash": cash_balance, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades, "total_asset_usd": total_asset_usd}
-
-
-def log_predictions(client, signals: pd.DataFrame, model_name: str):
-    if signals.empty:
-        return
-    records = []
-    for _, row in signals.iterrows():
-        records.append({
-            "symbol": row["symbol"],
-            "timestamp": int(row["timestamp"]),
-            "model_name": model_name,
-            "prediction": float(row["prediction"]),
-            "probability_up": float(row["probability_up"]),
-            "confidence": float(row["confidence"]),
-        })
-    if records:
-        client.table("predictions").upsert(records, on_conflict="symbol,timestamp").execute()
 
 
 def main():
@@ -255,9 +354,26 @@ def main():
     model_name = predictions["model_name"].iloc[0] if "model_name" in predictions else "unknown"
     print(f"  Using model: {model_name}")
 
+    # Staleness guard. Trading a prediction the trainer wrote hours ago is not
+    # trading a model, it is paying the spread on a constant.
+    fresh_mask = predictions["timestamp"].apply(lambda ts: is_prediction_fresh(ts, now_ms))
+    stale = predictions[~fresh_mask]
+    for _, row in stale.iterrows():
+        age_h = (now_ms - int(row["timestamp"])) / 3_600_000
+        print(f"  STALE: {row['symbol']} prediction is {age_h:.1f}h old (max {MAX_PREDICTION_AGE_HOURS}h) - ignoring")
+    predictions = predictions[fresh_mask]
+
+    if predictions.empty:
+        print(f"  No predictions fresher than {MAX_PREDICTION_AGE_HOURS}h. "
+              "Closing out and skipping new entries -- check the training step.")
+
     print("\n[3/6] Generating signals...")
-    signals = generate_signals(predictions)
-    active_signals = signals[signals["signal"] != 0]
+    if predictions.empty:
+        signals = pd.DataFrame()
+        active_signals = pd.DataFrame()
+    else:
+        signals = generate_signals(predictions)
+        active_signals = signals[signals["signal"] != 0]
     print(f"  Active signals: {len(active_signals)}")
     if not active_signals.empty:
         for _, s in active_signals.iterrows():
@@ -265,18 +381,25 @@ def main():
             est = s.get("estimated_change_pct", 0.0)
             print(f"    {s['symbol']}: {side} (P(up)={s['probability_up']:.2f}, est_change={est:.4f}, strength={s['signal_strength']:.2f})")
 
-    print("\n[4/6] Closing open positions...")
+    print("\n[4/6] Reconciling open positions...")
     open_trades = fetch_open_trades(client)
     print(f"  Open positions: {len(open_trades)}")
-    close_open_positions(client, open_trades, prices, now_ms)
+    # With no fresh signal at all, wanted={} closes everything rather than
+    # holding exposure the model can no longer justify.
+    wanted = desired_sides(active_signals)
+    close_open_positions(client, open_trades, prices, now_ms, wanted=wanted)
 
     print("\n[5/6] Opening new positions...")
     open_trades_after = fetch_open_trades(client)
+    held = desired_sides_from_trades(open_trades_after)
     trade_history = fetch_trade_history(client)
     total_asset_usd = INITIAL_CASH
     if not trade_history.empty and "actual_pnl_usd" in trade_history.columns:
         total_asset_usd += trade_history["actual_pnl_usd"].sum()
-    open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd)
+    if active_signals.empty:
+        print("  No fresh signals; not opening anything.")
+    else:
+        open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd, held=held)
 
     print("\n[6/6] Updating portfolio...")
     open_trades_final = fetch_open_trades(client)

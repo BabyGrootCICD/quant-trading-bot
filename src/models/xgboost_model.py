@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 try:
     from xgboost import XGBClassifier
@@ -11,12 +13,7 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
-FEATURE_COLS = [
-    "log_return_1h", "log_return_2h", "log_return_4h",
-    "log_return_8h", "log_return_24h",
-    "rsi_14", "macd", "macd_signal",
-    "bb_upper", "bb_lower", "volume_ratio",
-]
+from src.models.features import FEATURE_COLS
 
 MODEL_DIR = Path(__file__).parent / "checkpoints"
 
@@ -76,6 +73,68 @@ class XGBoostModel:
             "test_rows": len(X_test),
             "train_accuracy": round(train_acc, 4),
             "test_accuracy": round(test_acc, 4),
+            "expected_value_long": round(ev_up, 4),
+            "expected_value_short": round(ev_down, 4),
+            "feature_importances": importances,
+        }
+
+    def fit_walk_forward(self, df: pd.DataFrame, n_splits: int = 5) -> dict:
+        """Walk-forward CV, mirroring LogisticModel.fit_walk_forward.
+
+        The trainer calls this on whichever model is active. It was missing
+        here, so once check_auto_upgrade() selected xgboost_v1 every symbol
+        died with AttributeError and no model was ever trained.
+        """
+        X = df[FEATURE_COLS].values
+        y = df["target_1h"].values
+
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X, y = X[mask], y[mask]
+
+        if len(X) < 500:
+            return {"error": "insufficient data", "rows": len(X)}
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        all_preds = []
+        all_y_true = []
+
+        for train_idx, test_idx in tscv.split(X):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+
+            self.model.fit(X_train_scaled, y_train)
+
+            all_preds.extend(self.model.predict(X_test_scaled))
+            all_y_true.extend(y_test)
+
+        self.is_fitted = True
+
+        all_preds = np.array(all_preds)
+        all_y_true = np.array(all_y_true)
+
+        acc = float(np.mean(all_preds == all_y_true))
+
+        up_mask = all_preds == 1
+        down_mask = all_preds == 0
+        ev_up = float(np.mean(all_y_true[up_mask])) if up_mask.any() else 0.0
+        ev_down = float(np.mean(1 - all_y_true[down_mask])) if down_mask.any() else 0.0
+
+        importances = dict(zip(FEATURE_COLS, [round(float(v), 4) for v in self.model.feature_importances_]))
+
+        test_rows = len(all_y_true)
+
+        return {
+            "model_name": self.name,
+            "train_rows": len(X) - test_rows,
+            "test_rows": test_rows,
+            "train_accuracy": round(acc, 4),
+            "test_accuracy": round(acc, 4),
+            "precision": round(float(precision_score(all_y_true, all_preds, zero_division=0)), 4),
+            "recall": round(float(recall_score(all_y_true, all_preds, zero_division=0)), 4),
+            "f1": round(float(f1_score(all_y_true, all_preds, zero_division=0)), 4),
             "expected_value_long": round(ev_up, 4),
             "expected_value_short": round(ev_down, 4),
             "feature_importances": importances,

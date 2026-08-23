@@ -8,9 +8,13 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from config.settings import SYMBOLS
 from src.data.supabase_client import get_client
-from src.models.logistic import LogisticModel, FEATURE_COLS
+from src.models.features import FEATURE_COLS
+from src.models.logistic import LogisticModel
 from src.models.xgboost_model import XGBoostModel, HAS_XGBOOST
 from src.utils.metrics import sharpe_ratio, expected_value, win_rate
+
+LOGISTIC_MODEL_NAME = LogisticModel.name
+XGBOOST_MODEL_NAME = XGBoostModel.name
 
 
 def fetch_features(client, symbol: str) -> pd.DataFrame:
@@ -30,6 +34,30 @@ def fetch_features(client, symbol: str) -> pd.DataFrame:
     return df
 
 
+def upsert_latest_prediction(client, symbol: str, predictions: pd.DataFrame, model_name: str) -> bool:
+    """Write the newest prediction for `symbol` to the `predictions` table.
+
+    Nothing in the pipeline used to do this. The trainer computed predictions
+    and discarded them, so the paper-trading engine kept re-reading one frozen
+    row per symbol and churning the same positions hour after hour, paying the
+    round-trip spread on a signal that never changed.
+    """
+    valid = predictions.dropna(subset=["prediction", "probability_up"])
+    if valid.empty:
+        return False
+
+    row = valid.sort_values("timestamp").iloc[-1]
+    client.table("predictions").upsert({
+        "symbol": symbol,
+        "timestamp": int(row["timestamp"]),
+        "model_name": model_name,
+        "prediction": float(row["prediction"]),
+        "probability_up": float(row["probability_up"]),
+        "confidence": float(row["confidence"]),
+    }, on_conflict="symbol,timestamp").execute()
+    return True
+
+
 def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
     df = fetch_features(client, symbol)
     if df.empty or len(df) < 500:
@@ -43,6 +71,10 @@ def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
     valid = predictions.dropna(subset=["prediction"])
     if valid.empty:
         return {"symbol": symbol, **metrics, "trade_signals": 0}
+
+    metrics["prediction_written"] = upsert_latest_prediction(
+        client, symbol, valid, metrics.get("model_name", model.name)
+    )
 
     long_signals = valid[valid["prediction"] == 1]
     short_signals = valid[valid["prediction"] == 0]
@@ -77,6 +109,10 @@ def train_and_evaluate(client, symbol: str, model) -> dict:
     valid = predictions.dropna(subset=["prediction"])
     if valid.empty:
         return {"symbol": symbol, **metrics, "trade_signals": 0}
+
+    metrics["prediction_written"] = upsert_latest_prediction(
+        client, symbol, valid, metrics.get("model_name", model.name)
+    )
 
     long_signals = valid[valid["prediction"] == 1]
     short_signals = valid[valid["prediction"] == 0]
@@ -122,7 +158,7 @@ def check_auto_upgrade(client) -> str:
         .execute()
     )
     if not resp.data:
-        return "logistic_v1"
+        return LOGISTIC_MODEL_NAME
 
     df = pd.DataFrame(resp.data)
     df["evaluated_at"] = pd.to_datetime(df["evaluated_at"])
@@ -132,14 +168,14 @@ def check_auto_upgrade(client) -> str:
     recent = df[df["evaluated_at"] >= week_ago]
 
     if recent.empty:
-        return "logistic_v1"
+        return LOGISTIC_MODEL_NAME
 
     current_model = recent.iloc[0]["model_name"]
 
-    if current_model == "logistic_v1":
-        logistic_recent = recent[recent["model_name"] == "logistic_v1"]
+    if current_model == LOGISTIC_MODEL_NAME:
+        logistic_recent = recent[recent["model_name"] == LOGISTIC_MODEL_NAME]
         if len(logistic_recent) >= 7 and (logistic_recent["sharpe_ratio"] > 1).all():
-            return "xgboost_v1"
+            return XGBOOST_MODEL_NAME
 
     return current_model
 
@@ -154,15 +190,15 @@ def main():
     active_model_name = check_auto_upgrade(client)
     print(f"Active model: {active_model_name}")
 
-    if active_model_name == "xgboost_v1" and not HAS_XGBOOST:
-        print("WARNING: xgboost not installed, falling back to logistic_v1")
-        active_model_name = "logistic_v1"
+    if active_model_name == XGBOOST_MODEL_NAME and not HAS_XGBOOST:
+        print("WARNING: xgboost not installed, falling back to logistic")
+        active_model_name = LOGISTIC_MODEL_NAME
 
     all_metrics = []
     for symbol in SYMBOLS:
         print(f"\nTraining on {symbol}...")
         try:
-            if active_model_name == "xgboost_v1":
+            if active_model_name == XGBOOST_MODEL_NAME:
                 model = XGBoostModel()
             else:
                 model = LogisticModel()
@@ -179,6 +215,7 @@ def main():
 
         except Exception as e:
             print(f"  ERROR: {e}")
+            all_metrics.append({"symbol": symbol, "error": str(e)})
 
     print("\n" + "=" * 60)
     print("Training Summary")
@@ -205,6 +242,13 @@ def main():
         print("No models trained successfully.")
 
     print("=" * 60)
+
+    # Fail the pipeline instead of reporting green on a total training
+    # failure. Eight consecutive silent AttributeErrors are how the bot ended
+    # up trading a frozen prediction set for a full day.
+    if not valid:
+        print("FATAL: every symbol failed to train. See errors above.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

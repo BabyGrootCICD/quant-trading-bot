@@ -7,20 +7,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 
-FEATURE_COLS = [
-    "log_return_1h", "log_return_2h", "log_return_4h",
-    "log_return_8h", "log_return_24h",
-    "rsi_14", "rsi_7",
-    "macd", "macd_signal", "macd_hist",
-    "bb_upper", "bb_lower", "bb_width", "bb_position",
-    "volume_ratio", "volume_ratio_48",
-    "atr_14", "atr_14_pct",
-    "williams_r",
-    "stoch_k", "stoch_d",
-    "ha_trend",
-    "close_pct_ma20", "close_pct_ma50",
-    "vol_20", "skew_20",
-]
+from src.models.features import FEATURE_COLS
 
 MODEL_DIR = Path(__file__).parent / "checkpoints"
 
@@ -66,6 +53,11 @@ class LogisticModel:
             all_preds.extend(preds)
             all_probas.extend(probas)
             all_y_true.extend(y_test)
+
+        # The scaler/model now hold the final fold's fit; mark fitted so
+        # predict() works on the caller's side (this was missing, so every
+        # walk-forward run died with RuntimeError('Model not fitted')).
+        self.is_fitted = True
 
         all_preds = np.array(all_preds)
         all_probas = np.array(all_probas)

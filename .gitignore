@@ -6,3 +6,6 @@ __pycache__/
 src/models/checkpoints/
 .vscode/
 .DS_Store
+
+# Claude Code local workspace
+.claude/

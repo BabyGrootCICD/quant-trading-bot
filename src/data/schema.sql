@@ -30,7 +30,23 @@ CREATE TABLE IF NOT EXISTS features (
     bb_upper DOUBLE PRECISION,
     bb_lower DOUBLE PRECISION,
     volume_ratio DOUBLE PRECISION,
+    rsi_7 DOUBLE PRECISION,
+    macd_hist DOUBLE PRECISION,
+    bb_width DOUBLE PRECISION,
+    bb_position DOUBLE PRECISION,
+    volume_ratio_48 DOUBLE PRECISION,
+    atr_14 DOUBLE PRECISION,
+    atr_14_pct DOUBLE PRECISION,
+    williams_r DOUBLE PRECISION,
+    stoch_k DOUBLE PRECISION,
+    stoch_d DOUBLE PRECISION,
+    ha_trend DOUBLE PRECISION,
+    close_pct_ma20 DOUBLE PRECISION,
+    close_pct_ma50 DOUBLE PRECISION,
+    vol_20 DOUBLE PRECISION,
+    skew_20 DOUBLE PRECISION,
     target_1h SMALLINT,
+    target_4h SMALLINT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(symbol, timestamp)
 );
@@ -43,8 +59,11 @@ CREATE TABLE IF NOT EXISTS predictions (
     prediction DOUBLE PRECISION,
     probability_up DOUBLE PRECISION,
     confidence DOUBLE PRECISION,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(symbol, timestamp)
 );
+
+CREATE INDEX IF NOT EXISTS idx_predictions_symbol_time ON predictions(symbol, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS paper_trades (
     id BIGSERIAL PRIMARY KEY,

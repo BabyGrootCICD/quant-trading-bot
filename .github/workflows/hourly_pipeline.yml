@@ -2,7 +2,7 @@ name: 1 hour Pipeline (Fetch → Train → Trade)
 
 on:
   schedule:
-    - cron: '0 */1 * * *' #runs every 10 minutes
+    - cron: '0 */1 * * *' # runs hourly
   workflow_dispatch:
 
 concurrency:
@@ -21,6 +21,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Schema preflight
+        run: python -m src.data.schema_check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
       - name: Fetch OHLCV data
         run: python -m src.data.fetcher

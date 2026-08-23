@@ -60,10 +60,40 @@ def upsert_candles(client, rows: list[dict]) -> int:
     return total
 
 
+def latest_stored_timestamp(client, symbol: str) -> int | None:
+    """Newest candle timestamp already stored for `symbol`, or None."""
+    resp = (
+        client.table("candles")
+        .select("timestamp")
+        .eq("symbol", symbol)
+        .order("timestamp", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        return None
+    return int(resp.data[0]["timestamp"])
+
+
+def resolve_since(latest_ts: int | None, backfill_start_ms: int, overlap_bars: int = 2,
+                  bar_ms: int = 3_600_000) -> int:
+    """Where to resume fetching from.
+
+    Full backfill only when the symbol has no candles. Otherwise resume a
+    couple of bars before the newest stored one, so the most recent (possibly
+    still-forming) candle gets corrected without re-downloading two years of
+    history every single hour.
+    """
+    if latest_ts is None:
+        return backfill_start_ms
+    return max(backfill_start_ms, latest_ts - overlap_bars * bar_ms)
+
+
 def fetch_and_store(exchange, client, symbol: str) -> int:
-    since = exchange.parse8601(
+    backfill_start = exchange.parse8601(
         (datetime.now(timezone.utc) - timedelta(days=365 * HISTORY_YEARS)).isoformat()
     )
+    since = resolve_since(latest_stored_timestamp(client, symbol), backfill_start)
     print(f"  Fetching {symbol} since {datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()}...")
     candles = fetch_ohlcv_all(exchange, symbol, TIMEFRAME, since)
     print(f"  Fetched {len(candles)} candles")
