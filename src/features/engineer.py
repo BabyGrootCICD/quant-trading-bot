@@ -68,7 +68,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     volume = df["volume"]
 
     features = pd.DataFrame()
-    features["symbol"] = df["symbol"].iloc[0] if "symbol" in df.columns else "UNKNOWN"
+    if "symbol" in df.columns:
+        features["symbol"] = df["symbol"].values
+    else:
+        features["symbol"] = "UNKNOWN"
     features["timestamp"] = df["timestamp"]
 
     features["log_return_1h"] = compute_log_returns(close, 1)
