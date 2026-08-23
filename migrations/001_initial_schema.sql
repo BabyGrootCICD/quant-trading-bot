@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     slippage DOUBLE PRECISION DEFAULT 0,
     model_name VARCHAR(50),
     prediction_at_entry DOUBLE PRECISION,
+    actual_pnl_usd DOUBLE PRECISION DEFAULT 0,
     status VARCHAR(10) DEFAULT 'open',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS portfolio (
     total_pnl DOUBLE PRECISION NOT NULL,
     sharpe_ratio DOUBLE PRECISION,
     win_rate DOUBLE PRECISION,
+    total_asset_usd DOUBLE PRECISION,
     total_trades INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );

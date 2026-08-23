@@ -2,19 +2,26 @@ import numpy as np
 import pandas as pd
 
 
-LONG_THRESHOLD = 0.60
-SHORT_THRESHOLD = 0.40
+DEFAULT_LONG_THRESHOLD = 0.55
+DEFAULT_SHORT_THRESHOLD = 0.45
+DEFAULT_MAX_CHANGE_PCT = 0.02
 
 
-def generate_signals(predictions: pd.DataFrame) -> pd.DataFrame:
+def generate_signals(
+    predictions: pd.DataFrame,
+    long_threshold: float = DEFAULT_LONG_THRESHOLD,
+    short_threshold: float = DEFAULT_SHORT_THRESHOLD,
+) -> pd.DataFrame:
     signals = predictions.copy()
     signals["signal"] = 0
 
-    long_mask = signals["probability_up"] >= LONG_THRESHOLD
-    short_mask = signals["probability_up"] <= SHORT_THRESHOLD
+    long_mask = signals["probability_up"] > long_threshold
+    short_mask = signals["probability_up"] < short_threshold
 
     signals.loc[long_mask, "signal"] = 1
     signals.loc[short_mask, "signal"] = -1
+
+    signals["estimated_change_pct"] = (signals["probability_up"] - 0.5) * 2 * DEFAULT_MAX_CHANGE_PCT
 
     signals["signal_strength"] = np.where(
         signals["signal"] == 1,

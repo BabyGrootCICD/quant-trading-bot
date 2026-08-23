@@ -65,7 +65,7 @@ def fetch_open_trades(client) -> pd.DataFrame:
 def fetch_trade_history(client, limit: int = 500) -> pd.DataFrame:
     resp = (
         client.table("paper_trades")
-        .select("pnl,status")
+        .select("pnl,status,actual_pnl_usd")
         .neq("status", "open")
         .order("created_at", desc=True)
         .limit(limit)
@@ -77,7 +77,7 @@ def fetch_trade_history(client, limit: int = 500) -> pd.DataFrame:
 def fetch_portfolio_history(client, limit: int = 168) -> pd.DataFrame:
     resp = (
         client.table("portfolio")
-        .select("equity,timestamp")
+        .select("equity,total_asset_usd,timestamp")
         .order("timestamp", desc=True)
         .limit(limit)
         .execute()
@@ -106,19 +106,21 @@ def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, fl
 
         fees = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
         net_pnl = raw_pnl - fees
+        actual_pnl_usd = net_pnl
 
         client.table("paper_trades").update({
             "exit_price": current_price,
             "exit_time": now_ms,
             "pnl": round(net_pnl, 4),
+            "actual_pnl_usd": round(actual_pnl_usd, 4),
             "fees": round(fees, 4),
             "status": "closed",
         }).eq("id", trade["id"]).execute()
 
-        print(f"  Closed {side} {symbol}: entry={entry_price:.2f} exit={current_price:.2f} pnl={net_pnl:.2f}")
+        print(f"  Closed {side} {symbol}: entry={entry_price:.2f} exit={current_price:.2f} pnl=${actual_pnl_usd:.2f}")
 
 
-def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str):
+def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str, total_asset_usd: float):
     if signals.empty:
         return
 
@@ -133,7 +135,17 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
 
         side = "long" if signal == 1 else "short"
         current_price = prices[symbol]
-        size = calculate_position_size(row["signal_strength"], method="tanh")
+        estimated_change_pct = row.get("estimated_change_pct", 0.0)
+        size = calculate_position_size(
+            row["signal_strength"],
+            method="percentage",
+            estimated_change_pct=estimated_change_pct,
+            total_asset_usd=total_asset_usd,
+        )
+
+        if size < 1.0:
+            print(f"  Skipped {symbol}: size too small (${size:.2f})")
+            continue
 
         client.table("paper_trades").insert({
             "symbol": symbol,
@@ -146,7 +158,7 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
             "status": "open",
         }).execute()
 
-        print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} confidence={row['signal_strength']:.2f}")
+        print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
 
 
 def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dict[str, float],
@@ -167,6 +179,7 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
             positions_value += size + pnl
 
     equity = cash + positions_value
+    total_asset_usd = equity
 
     closed_pnl = []
     if not trade_history.empty and "pnl" in trade_history.columns:
@@ -183,12 +196,13 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
         "cash": round(cash, 2),
         "positions_value": round(positions_value, 2),
         "total_pnl": round(total_pnl, 2),
+        "total_asset_usd": round(total_asset_usd, 2),
         "sharpe_ratio": round(sr, 4),
         "win_rate": round(wr, 4),
         "total_trades": total_trades,
     }).execute()
 
-    return {"equity": equity, "cash": cash, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades}
+    return {"equity": equity, "cash": cash, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades, "total_asset_usd": total_asset_usd}
 
 
 def log_predictions(client, signals: pd.DataFrame, model_name: str):
@@ -236,8 +250,9 @@ def main():
     print(f"  Active signals: {len(active_signals)}")
     if not active_signals.empty:
         for _, s in active_signals.iterrows():
-            side = "LONG" if s["signal"] == 1 else "SHORT"
-            print(f"    {s['symbol']}: {side} (P(up)={s['probability_up']:.2f}, strength={s['signal_strength']:.2f})")
+            side = "BUY" if s["signal"] == 1 else "SELL"
+            est = s.get("estimated_change_pct", 0.0)
+            print(f"    {s['symbol']}: {side} (P(up)={s['probability_up']:.2f}, est_change={est:.4f}, strength={s['signal_strength']:.2f})")
 
     print("\n[4/6] Closing open positions...")
     open_trades = fetch_open_trades(client)
@@ -245,12 +260,17 @@ def main():
     close_open_positions(client, open_trades, prices, now_ms)
 
     print("\n[5/6] Opening new positions...")
-    open_new_positions(client, active_signals, prices, now_ms, model_name)
-
-    print("\n[6/6] Updating portfolio...")
     open_trades_after = fetch_open_trades(client)
     trade_history = fetch_trade_history(client)
-    portfolio = update_portfolio(client, INITIAL_CASH, open_trades_after, prices, trade_history, now_ms)
+    total_asset_usd = INITIAL_CASH
+    if not trade_history.empty and "actual_pnl_usd" in trade_history.columns:
+        total_asset_usd += trade_history["actual_pnl_usd"].sum()
+    open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd)
+
+    print("\n[6/6] Updating portfolio...")
+    open_trades_final = fetch_open_trades(client)
+    portfolio = update_portfolio(client, INITIAL_CASH, open_trades_final, prices, trade_history, now_ms)
+    print(f"  Total Asset: ${portfolio['total_asset_usd']:.2f}")
     print(f"  Equity: ${portfolio['equity']:.2f}")
     print(f"  Total P&L: ${portfolio['total_pnl']:.2f}")
     print(f"  Sharpe: {portfolio['sharpe']:.4f}")
