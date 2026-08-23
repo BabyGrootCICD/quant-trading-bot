@@ -10,8 +10,7 @@ EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binanceus")
 
 SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
-    "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT",
-    "DOT/USDT", "LINK/USDT", "USDC/USDT", "DAI/USDT",
+    "XRP/USDT", "ADA/USDT", "DOGE/USDT", "TRX/USDT",
 ]
 
 TIMEFRAME = "1h"

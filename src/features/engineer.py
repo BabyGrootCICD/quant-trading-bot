@@ -95,14 +95,32 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
+def _clean_value(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return None
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    return v
+
+
 def upsert_features(client, symbol: str, features: pd.DataFrame) -> int:
     if features.empty:
         return 0
 
-    records = features.where(features.notna(), None).to_dict(orient="records")
+    records = features.to_dict(orient="records")
     clean_records = []
     for r in records:
-        rec = {k: v for k, v in r.items() if v is not None and k != "id"}
+        rec = {}
+        for k, v in r.items():
+            if k == "id":
+                continue
+            cleaned = _clean_value(v)
+            if cleaned is not None:
+                rec[k] = cleaned
         clean_records.append(rec)
 
     if not clean_records:
