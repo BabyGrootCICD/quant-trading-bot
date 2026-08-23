@@ -30,12 +30,46 @@ def fetch_features(client, symbol: str) -> pd.DataFrame:
     return df
 
 
+def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
+    df = fetch_features(client, symbol)
+    if df.empty or len(df) < 500:
+        return {"symbol": symbol, "error": "insufficient data"}
+
+    metrics = model.fit_walk_forward(df, n_splits=n_splits)
+    if "error" in metrics:
+        return {"symbol": symbol, **metrics}
+
+    predictions = model.predict(df)
+    valid = predictions.dropna(subset=["prediction"])
+    if valid.empty:
+        return {"symbol": symbol, **metrics, "trade_signals": 0}
+
+    long_signals = valid[valid["prediction"] == 1]
+    short_signals = valid[valid["prediction"] == 0]
+
+    merged = valid.merge(df[["timestamp", "target_1h"]], on="timestamp", how="left")
+
+    long_pnl = merged.loc[merged["prediction"] == 1, "target_1h"].apply(lambda x: 1 if x == 1 else -1).tolist()
+    short_pnl = merged.loc[merged["prediction"] == 0, "target_1h"].apply(lambda x: 1 if x == 0 else -1).tolist()
+    all_pnl = long_pnl + short_pnl
+
+    metrics["symbol"] = symbol
+    metrics["total_signals"] = len(valid)
+    metrics["long_signals"] = len(long_signals)
+    metrics["short_signals"] = len(short_signals)
+    metrics["ev"] = round(expected_value(all_pnl), 4) if all_pnl else 0.0
+    metrics["sharpe"] = round(sharpe_ratio(all_pnl), 4) if all_pnl else 0.0
+    metrics["win_rate"] = round(win_rate(all_pnl), 4) if all_pnl else 0.0
+
+    return metrics
+
+
 def train_and_evaluate(client, symbol: str, model) -> dict:
     df = fetch_features(client, symbol)
     if df.empty or len(df) < 200:
         return {"symbol": symbol, "error": "insufficient data"}
 
-    metrics = model.fit(df)
+    metrics = model.train_and_evaluate(client, symbol)
     if "error" in metrics:
         return {"symbol": symbol, **metrics}
 
@@ -133,35 +167,15 @@ def main():
             else:
                 model = LogisticModel()
 
-            metrics = train_and_evaluate(client, symbol, model)
+            metrics = train_walk_forward(client, symbol, model, n_splits=5)
             all_metrics.append(metrics)
             log_model_metrics(client, metrics)
 
             if "error" not in metrics:
                 print(f"  Accuracy: {metrics.get('test_accuracy', 'N/A')}")
-                print(f"  EV: {metrics.get('ev', 'N/A')}")
                 print(f"  Sharpe: {metrics.get('sharpe', 'N/A')}")
                 print(f"  Win rate: {metrics.get('win_rate', 'N/A')}")
                 print(f"  Signals: {metrics.get('total_signals', 0)}")
-
-                df = fetch_features(client, symbol)
-                if not df.empty:
-                    latest = df.tail(1)
-                    pred = model.predict(latest)
-                    if not pred.empty and pred["prediction"].notna().any():
-                        row = pred.iloc[0]
-                        client.table("predictions").delete().eq("symbol", symbol).execute()
-                        client.table("predictions").insert({
-                            "symbol": symbol,
-                            "timestamp": int(row["timestamp"]),
-                            "model_name": active_model_name,
-                            "prediction": float(row["prediction"]),
-                            "probability_up": float(row["probability_up"]),
-                            "confidence": float(row["confidence"]),
-                        }).execute()
-                        print(f"  Prediction: P(up)={row['probability_up']:.3f} -> {'LONG' if row['prediction'] == 1 else 'SHORT'}")
-            else:
-                print(f"  Skipped: {metrics.get('error')}")
 
         except Exception as e:
             print(f"  ERROR: {e}")

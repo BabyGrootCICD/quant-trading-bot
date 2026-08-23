@@ -73,11 +73,43 @@ def compute_volume_ratio(volume: pd.Series, period: int = 24) -> pd.Series:
     return volume / avg_vol.replace(0, np.nan)
 
 
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period, min_periods=period).mean()
+
+
+def compute_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    highest_high = high.rolling(window=period).max()
+    lowest_low = low.rolling(window=period).min()
+    return -100 * (highest_high - close) / (highest_high - lowest_low)
+
+
+def compute_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low)
+    d = k.rolling(window=d_period).mean()
+    return k, d
+
+
+def compute_heikin_ashi(close: pd.Series) -> pd.Series:
+    ha_close = (close + close.shift(1) + close.shift(2) + close.shift(3)) / 4
+    ha_open = close.shift(1)
+    ha_high = close.rolling(4).max()
+    ha_low = close.rolling(4).min()
+    return (ha_close + ha_open + ha_high + ha_low) / 4
+
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or len(df) < 30:
+    if df.empty or len(df) < 50:
         return pd.DataFrame()
 
     close = df["close"]
+    high = df["high"]
+    low = df["low"]
     volume = df["volume"]
 
     features = pd.DataFrame()
@@ -94,18 +126,39 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     features["log_return_24h"] = compute_log_returns(close, 24)
 
     features["rsi_14"] = compute_rsi(close, 14)
+    features["rsi_7"] = compute_rsi(close, 7)
 
     macd_line, signal_line = compute_macd(close)
     features["macd"] = macd_line
     features["macd_signal"] = signal_line
+    features["macd_hist"] = macd_line - signal_line
 
     bb_upper, bb_lower = compute_bollinger(close)
     features["bb_upper"] = bb_upper
     features["bb_lower"] = bb_lower
+    features["bb_width"] = (bb_upper - bb_lower) / close
+    features["bb_position"] = (close - bb_lower) / (bb_upper - bb_lower)
 
     features["volume_ratio"] = compute_volume_ratio(volume)
+    features["volume_ratio_48"] = compute_volume_ratio(volume, 48)
+
+    features["atr_14"] = compute_atr(high, low, close)
+    features["atr_14_pct"] = features["atr_14"] / close
+
+    features["williams_r"] = compute_williams_r(high, low, close)
+    stoch_k, stoch_d = compute_stochastic(high, low, close)
+    features["stoch_k"] = stoch_k
+    features["stoch_d"] = stoch_d
+
+    features["ha_trend"] = compute_heikin_ashi(close)
+
+    features["close_pct_ma20"] = close / close.rolling(20).mean() - 1
+    features["close_pct_ma50"] = close / close.rolling(50).mean() - 1
+    features["vol_20"] = close.pct_change().rolling(20).std()
+    features["skew_20"] = close.pct_change().rolling(20).skew()
 
     features["target_1h"] = (features["log_return_1h"].shift(-1) > 0).astype(int)
+    features["target_4h"] = (features["log_return_4h"].shift(-4) > 0).astype(int)
 
     features = features.replace([np.inf, -np.inf], np.nan)
     return features
@@ -159,13 +212,13 @@ def process_symbol(client, symbol: str) -> int:
     df["symbol"] = symbol
     features = engineer_features(df)
     count = upsert_features(client, symbol, features)
-    print(f"  {symbol}: {count} feature rows")
+    print(f"  {symbol}: {count} feature rows ({len(features.columns)} features)")
     return count
 
 
 def main():
     print("=" * 60)
-    print("Quant Bot - Feature Engineering")
+    print("Quant Bot - Feature Engineering (Enhanced)")
     print("=" * 60)
     client = get_client()
 
