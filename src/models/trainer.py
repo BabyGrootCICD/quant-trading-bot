@@ -143,6 +143,22 @@ def main():
                 print(f"  Sharpe: {metrics.get('sharpe', 'N/A')}")
                 print(f"  Win rate: {metrics.get('win_rate', 'N/A')}")
                 print(f"  Signals: {metrics.get('total_signals', 0)}")
+
+                df = fetch_features(client, symbol)
+                if not df.empty:
+                    latest = df.tail(1)
+                    pred = model.predict(latest)
+                    if not pred.empty and pred["prediction"].notna().any():
+                        row = pred.iloc[0]
+                        client.table("predictions").upsert({
+                            "symbol": symbol,
+                            "timestamp": int(row["timestamp"]),
+                            "model_name": active_model_name,
+                            "prediction": float(row["prediction"]),
+                            "probability_up": float(row["probability_up"]),
+                            "confidence": float(row["confidence"]),
+                        }, on_conflict="symbol,timestamp").execute()
+                        print(f"  Prediction: P(up)={row['probability_up']:.3f} -> {'LONG' if row['prediction'] == 1 else 'SHORT'}")
             else:
                 print(f"  Skipped: {metrics.get('error')}")
 
