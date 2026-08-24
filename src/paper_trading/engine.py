@@ -15,7 +15,9 @@ from src.strategy.economics import (
     is_tradeable, expected_value, breakeven_accuracy, round_trip_cost_pct,
     TAKER_FEE, SLIPPAGE_BPS,
 )
-from src.utils.metrics import sharpe_ratio, win_rate, trade_returns, annualization_factor
+from src.utils.metrics import (
+    sharpe_ratio, win_rate, trade_returns, annualization_factor, MIN_SHARPE_TRADES,
+)
 
 INITIAL_CASH = 10000.0
 
@@ -310,7 +312,7 @@ def filter_to_stats_epoch(trade_history: pd.DataFrame, epoch_ms: int = STATS_EPO
     return trade_history[times >= epoch_ms]
 
 
-def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float:
+def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float | None:
     """Annualized Sharpe over the most recent `window` closed trades.
 
     Three bugs used to live here:
@@ -321,20 +323,22 @@ def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float:
         returns newest-first.
     """
     if trade_history.empty or "pnl" not in trade_history.columns:
-        return 0.0
+        return None
     if "size" not in trade_history.columns:
-        return 0.0
+        return None
 
     hist = trade_history.dropna(subset=["pnl", "size"])
     if hist.empty:
-        return 0.0
+        return None
 
     # Newest-first from the query, so the newest `window` rows are the head.
     recent = hist.head(window)
 
     rets = trade_returns(recent["pnl"].tolist(), recent["size"].tolist())
-    if len(rets) < 2:
-        return 0.0
+    if len(rets) < MIN_SHARPE_TRADES:
+        # Not enough closed trades to say anything. Reporting 0.0 here would be
+        # a claim -- "zero risk-adjusted return" -- rather than "unknown".
+        return None
 
     span_hours = 0.0
     if "exit_time" in recent.columns:
@@ -343,7 +347,8 @@ def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float:
             span_hours = (times.max() - times.min()) / 3_600_000
 
     ppy = annualization_factor(len(rets), span_hours)
-    return sharpe_ratio(rets, periods_per_year=ppy)
+    sr = sharpe_ratio(rets, periods_per_year=ppy)
+    return sr
 
 
 def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dict[str, float],
@@ -393,9 +398,9 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     if not stats_history.empty and "pnl" in stats_history.columns:
         closed_pnl = stats_history["pnl"].dropna().tolist()
 
-    wr = win_rate(closed_pnl)
-    sr = compute_sharpe(stats_history)
     scored_trades = len(closed_pnl)
+    wr = win_rate(closed_pnl) if scored_trades else None
+    sr = compute_sharpe(stats_history)
 
     client.table("portfolio").insert({
         "timestamp": now_ms,
@@ -404,8 +409,8 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
         "positions_value": round(positions_value, 2),
         "total_pnl": round(total_pnl, 2),
         "total_asset_usd": round(total_asset_usd, 2),
-        "sharpe_ratio": round(sr, 4),
-        "win_rate": round(wr, 4),
+        "sharpe_ratio": round(sr, 4) if sr is not None else None,
+        "win_rate": round(wr, 4) if wr is not None else None,
         "total_trades": total_trades,
     }).execute()
 
@@ -499,13 +504,17 @@ def main():
     print(f"  Total Asset: ${portfolio['total_asset_usd']:.2f}")
     print(f"  Equity: ${portfolio['equity']:.2f}")
     print(f"  Total P&L: ${portfolio['total_pnl']:.2f}")
-    print(f"  Sharpe: {portfolio['sharpe']:.4f}")
-    print(f"  Win Rate: {portfolio['win_rate']:.2%}")
+    scored = portfolio["scored_trades"]
+    if portfolio["sharpe"] is None:
+        print(f"  Sharpe: n/a ({scored}/{MIN_SHARPE_TRADES} scored trades needed)")
+    else:
+        print(f"  Sharpe: {portfolio['sharpe']:.4f}")
+    if portfolio["win_rate"] is None:
+        print("  Win Rate: n/a (no trades closed since the stats epoch)")
+    else:
+        print(f"  Win Rate: {portfolio['win_rate']:.2%} (over {scored} trades)")
     print(f"  Total Trades: {portfolio['total_trades']} "
           f"(scored since epoch: {portfolio['scored_trades']})")
-    if portfolio["scored_trades"] == 0:
-        print("  No trades closed since the stats epoch yet -- "
-              "sharpe/win_rate stay 0 until the first post-fix trade closes.")
 
     print("\n" + "=" * 60)
     print("Paper trading cycle complete.")
