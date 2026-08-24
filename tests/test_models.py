@@ -65,3 +65,16 @@ def test_both_models_share_one_feature_list():
     import src.models.xgboost_model as xgb
     import src.models.logistic as lr
     assert xgb.FEATURE_COLS is lr.FEATURE_COLS is FEATURE_COLS
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_walk_forward_exposes_out_of_sample_predictions(model_cls):
+    """The trainer needs these to score honestly instead of in-sample."""
+    metrics = model_cls().fit_walk_forward(_training_frame(), n_splits=3)
+
+    assert len(metrics["oos_preds"]) == len(metrics["oos_y_true"])
+    assert len(metrics["oos_preds"]) == metrics["test_rows"]
+
+    # And they must agree with the reported accuracy.
+    agree = sum(1 for p, y in zip(metrics["oos_preds"], metrics["oos_y_true"]) if p == y)
+    assert agree / len(metrics["oos_preds"]) == pytest.approx(metrics["test_accuracy"], abs=1e-4)

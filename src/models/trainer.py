@@ -13,25 +13,72 @@ from src.models.logistic import LogisticModel
 from src.models.xgboost_model import XGBoostModel, HAS_XGBOOST
 from src.utils.metrics import sharpe_ratio, expected_value, win_rate
 
+# Cap on how much history each training run pulls. Two years of hourly bars
+# is ~17.5k rows; this keeps the whole window without unbounded growth.
+MAX_TRAINING_ROWS = 20000
+
 LOGISTIC_MODEL_NAME = LogisticModel.name
 XGBOOST_MODEL_NAME = XGBoostModel.name
 
 
-def fetch_features(client, symbol: str) -> pd.DataFrame:
-    resp = (
-        client.table("features")
-        .select("*")
-        .eq("symbol", symbol)
-        .order("timestamp", desc=False)
-        .execute()
-    )
-    if not resp.data:
+def fetch_features(client, symbol: str, max_rows: int = MAX_TRAINING_ROWS) -> pd.DataFrame:
+    """Most recent `max_rows` feature rows for `symbol`, oldest-first.
+
+    This used to be an unpaginated `.select("*")` ordered ascending. PostgREST
+    caps a response at 1000 rows, so the trainer silently received the *oldest*
+    1000 rows -- it trained on two-year-old data and stamped its prediction
+    with a two-year-old timestamp, which the engine then rejected as stale.
+
+    Paginate explicitly, newest-first, then flip to chronological order for
+    the walk-forward split.
+    """
+    all_data = []
+    page = 1000
+    offset = 0
+
+    while offset < max_rows:
+        limit = min(page, max_rows - offset)
+        resp = (
+            client.table("features")
+            .select("*")
+            .eq("symbol", symbol)
+            .order("timestamp", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < limit:
+            break
+        offset += limit
+
+    if not all_data:
         return pd.DataFrame()
-    df = pd.DataFrame(resp.data)
+
+    df = pd.DataFrame(all_data)
+    df["timestamp"] = df["timestamp"].astype("int64")
+    df = df.sort_values("timestamp").reset_index(drop=True)
     for col in FEATURE_COLS + ["target_1h"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def out_of_sample_pnl(metrics: dict) -> list[float]:
+    """+1 per correct out-of-sample call, -1 per incorrect one.
+
+    Scoring used to run `model.predict(df)` over the whole feature frame,
+    most of which the final walk-forward fold had trained on. That reported a
+    0.91 win rate and a Sharpe of 135 against a true test accuracy of 0.52 --
+    and check_auto_upgrade() gates on `sharpe_ratio > 1`, so the bogus figure
+    drove model promotion too.
+    """
+    preds = metrics.get("oos_preds")
+    y_true = metrics.get("oos_y_true")
+    if not preds or not y_true:
+        return []
+    return [1.0 if p == y else -1.0 for p, y in zip(preds, y_true)]
 
 
 def upsert_latest_prediction(client, symbol: str, predictions: pd.DataFrame, model_name: str) -> bool:
@@ -76,22 +123,19 @@ def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
         client, symbol, valid, metrics.get("model_name", model.name)
     )
 
-    long_signals = valid[valid["prediction"] == 1]
-    short_signals = valid[valid["prediction"] == 0]
-
-    merged = valid.merge(df[["timestamp", "target_1h"]], on="timestamp", how="left")
-
-    long_pnl = merged.loc[merged["prediction"] == 1, "target_1h"].apply(lambda x: 1 if x == 1 else -1).tolist()
-    short_pnl = merged.loc[merged["prediction"] == 0, "target_1h"].apply(lambda x: 1 if x == 0 else -1).tolist()
-    all_pnl = long_pnl + short_pnl
+    all_pnl = out_of_sample_pnl(metrics)
 
     metrics["symbol"] = symbol
-    metrics["total_signals"] = len(valid)
-    metrics["long_signals"] = len(long_signals)
-    metrics["short_signals"] = len(short_signals)
+    metrics["total_signals"] = len(all_pnl)
+    metrics["long_signals"] = int(sum(1 for p in metrics.get("oos_preds", []) if p == 1))
+    metrics["short_signals"] = int(sum(1 for p in metrics.get("oos_preds", []) if p == 0))
     metrics["ev"] = round(expected_value(all_pnl), 4) if all_pnl else 0.0
     metrics["sharpe"] = round(sharpe_ratio(all_pnl), 4) if all_pnl else 0.0
     metrics["win_rate"] = round(win_rate(all_pnl), 4) if all_pnl else 0.0
+
+    # Bulky and already summarised; do not carry into the metrics row.
+    metrics.pop("oos_preds", None)
+    metrics.pop("oos_y_true", None)
 
     return metrics
 
@@ -114,22 +158,19 @@ def train_and_evaluate(client, symbol: str, model) -> dict:
         client, symbol, valid, metrics.get("model_name", model.name)
     )
 
-    long_signals = valid[valid["prediction"] == 1]
-    short_signals = valid[valid["prediction"] == 0]
-
-    merged = valid.merge(df[["timestamp", "target_1h"]], on="timestamp", how="left")
-
-    long_pnl = merged.loc[merged["prediction"] == 1, "target_1h"].apply(lambda x: 1 if x == 1 else -1).tolist()
-    short_pnl = merged.loc[merged["prediction"] == 0, "target_1h"].apply(lambda x: 1 if x == 0 else -1).tolist()
-    all_pnl = long_pnl + short_pnl
+    all_pnl = out_of_sample_pnl(metrics)
 
     metrics["symbol"] = symbol
-    metrics["total_signals"] = len(valid)
-    metrics["long_signals"] = len(long_signals)
-    metrics["short_signals"] = len(short_signals)
+    metrics["total_signals"] = len(all_pnl)
+    metrics["long_signals"] = int(sum(1 for p in metrics.get("oos_preds", []) if p == 1))
+    metrics["short_signals"] = int(sum(1 for p in metrics.get("oos_preds", []) if p == 0))
     metrics["ev"] = round(expected_value(all_pnl), 4) if all_pnl else 0.0
     metrics["sharpe"] = round(sharpe_ratio(all_pnl), 4) if all_pnl else 0.0
     metrics["win_rate"] = round(win_rate(all_pnl), 4) if all_pnl else 0.0
+
+    # Bulky and already summarised; do not carry into the metrics row.
+    metrics.pop("oos_preds", None)
+    metrics.pop("oos_y_true", None)
 
     return metrics
 

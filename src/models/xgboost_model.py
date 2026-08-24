@@ -138,6 +138,12 @@ class XGBoostModel:
             "expected_value_long": round(ev_up, 4),
             "expected_value_short": round(ev_down, 4),
             "feature_importances": importances,
+            # Out-of-sample fold predictions. The trainer must score on
+            # these, not on predict() over the full frame -- that frame
+            # includes the rows the final fold trained on, which is how
+            # an honest 0.52 accuracy got reported as a 0.91 win rate.
+            "oos_preds": all_preds.tolist(),
+            "oos_y_true": all_y_true.tolist(),
         }
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -75,3 +75,93 @@ def test_model_names_are_not_hardcoded_stale_strings():
     from src.models.xgboost_model import XGBoostModel
     assert trainer.LOGISTIC_MODEL_NAME == LogisticModel.name
     assert trainer.XGBOOST_MODEL_NAME == XGBoostModel.name
+
+
+# --- out-of-sample scoring -------------------------------------------------
+
+def test_pnl_comes_from_out_of_sample_folds():
+    """Scoring on predict() over the full frame reported 0.91 against a true 0.52."""
+    metrics = {"oos_preds": [1, 0, 1, 0], "oos_y_true": [1, 0, 0, 1]}
+    assert trainer.out_of_sample_pnl(metrics) == [1.0, 1.0, -1.0, -1.0]
+
+
+def test_win_rate_matches_out_of_sample_accuracy():
+    """A 52% model must score ~0.52, not 0.91."""
+    from src.utils.metrics import win_rate
+    preds = [1] * 100
+    truth = [1] * 52 + [0] * 48
+    pnl = trainer.out_of_sample_pnl({"oos_preds": preds, "oos_y_true": truth})
+    assert win_rate(pnl) == pytest.approx(0.52)
+
+
+def test_missing_oos_arrays_degrade_to_empty():
+    assert trainer.out_of_sample_pnl({}) == []
+    assert trainer.out_of_sample_pnl({"oos_preds": [], "oos_y_true": []}) == []
+
+
+def test_oos_arrays_are_stripped_before_logging():
+    """They are large and would bloat every model_metrics row."""
+    import inspect
+    src = inspect.getsource(trainer.train_walk_forward)
+    assert 'metrics.pop("oos_preds", None)' in src
+    assert 'metrics.pop("oos_y_true", None)' in src
+
+
+# --- pagination ------------------------------------------------------------
+
+class PagingClient:
+    """Mimics PostgREST: refuses to return more than 1000 rows per request."""
+
+    def __init__(self, n_rows):
+        self.n_rows = n_rows
+        self.descending = None
+        self.rows = [{"symbol": "BTC/USDT", "timestamp": i * 3_600_000, "target_1h": 0}
+                     for i in range(n_rows)]
+
+    def table(self, name):
+        return self
+
+    def select(self, *a):
+        return self
+
+    def eq(self, *a):
+        return self
+
+    def order(self, col, desc=False):
+        self.descending = desc
+        return self
+
+    def range(self, lo, hi):
+        ordered = list(reversed(self.rows)) if self.descending else self.rows
+        self._slice = ordered[lo : min(hi + 1, lo + 1000)]
+        return self
+
+    def execute(self):
+        return type("Resp", (), {"data": self._slice})()
+
+
+def test_fetch_features_pages_past_the_1000_row_cap():
+    client = PagingClient(5000)
+    df = trainer.fetch_features(client, "BTC/USDT")
+    assert len(df) == 5000
+
+
+def test_fetch_features_returns_the_newest_rows_not_the_oldest():
+    """The bug: ascending + no pagination handed back the oldest 1000 rows."""
+    client = PagingClient(5000)
+    df = trainer.fetch_features(client, "BTC/USDT", max_rows=1000)
+
+    assert len(df) == 1000
+    newest = 4999 * 3_600_000
+    assert df["timestamp"].max() == newest, "must include the most recent bar"
+    assert df["timestamp"].min() == 4000 * 3_600_000
+
+
+def test_fetch_features_returns_chronological_order():
+    """Walk-forward splitting depends on chronological order."""
+    df = trainer.fetch_features(PagingClient(3000), "BTC/USDT")
+    assert df["timestamp"].is_monotonic_increasing
+
+
+def test_fetch_features_handles_empty_table():
+    assert trainer.fetch_features(PagingClient(0), "BTC/USDT").empty
