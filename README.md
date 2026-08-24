@@ -24,10 +24,10 @@ Hourly crypto trading bot using ML predictions on BinanceUS, scheduled via GitHu
 
 | Time | Workflow | Action |
 |------|----------|--------|
-| :07 | Fetch Hourly Data | Pull candles, compute features |
-| :12 | Paper Trade | Fetch prices, predict, trade |
-| Sun 3AM | Train Model | Retrain all 8 models |
-| Sun 6AM | Quantum Optimization | Portfolio opt, risk analysis, kernel comparison |
+| Hourly (:00) | `hourly_pipeline.yml` | Fetch candles → compute features → train models → paper trade (single run) |
+| Sun 6AM (UTC) | `quantum_optimize.yml` | Portfolio opt, risk analysis, kernel comparison |
+
+> Fetch, feature computation, training, and paper trading all run together in the hourly pipeline; there is no separate weekly training workflow. Whether training *should* run hourly vs weekly is tracked in #2.
 
 ## Quick Start
 
