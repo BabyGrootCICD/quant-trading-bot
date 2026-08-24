@@ -175,3 +175,33 @@ def test_float_features_stay_floats():
     assert _clean_value(1.0, "target_1h") == 1
     assert isinstance(_clean_value(1.0, "target_1h"), int)
     assert _clean_value(float("nan"), "target_1h") is None
+
+
+# --- the bootstrap schema must not drift from the migration chain ----------
+#
+# src/data/schema.sql provisions a database in one shot; migrations/ evolves an
+# existing one. They had silently diverged: schema.sql carried no exit_reason,
+# no target_move_1h, none of the prediction magnitude columns, and -- worst --
+# no paper_trades_one_open_per_symbol, so a database built from it lacked the
+# concurrency guard entirely and the engine's duplicate handler could never
+# fire.
+
+def test_bootstrap_schema_has_every_migrated_column():
+    added = _migration_columns()
+    bootstrap = set()
+    for table in ("features", "predictions", "paper_trades", "portfolio"):
+        bootstrap |= _schema_columns(table)
+    missing = sorted(added - bootstrap)
+    assert not missing, (
+        f"src/data/schema.sql is missing columns the migrations add: {missing}. "
+        "A database provisioned from it would not match one migrated up."
+    )
+
+
+def test_bootstrap_schema_has_the_one_open_per_symbol_guard():
+    sql = (ROOT / "src" / "data" / "schema.sql").read_text()
+    assert "paper_trades_one_open_per_symbol" in sql, (
+        "migration 005 enforces at most one open position per symbol; without "
+        "the same index here, a freshly provisioned database silently allows "
+        "the duplicates the engine relies on the database to reject."
+    )

@@ -190,3 +190,136 @@ paste it into the Supabase SQL editor, then:
 ```
 python -m migrations.run_migrations --mark 004 004_ev_allocation
 ```
+
+
+---
+
+# Addendum, 2026-08-24 evening: the gate was never reached
+
+## The bot went idle, and the calibration patch is why
+
+`portfolio` rows 28-34: equity 9988.22, positions 0, `total_pnl` -11.78,
+`total_trades` frozen at 77 for six hours. Three things in that picture are
+working as designed and one is not.
+
+Working: `sharpe_ratio` NULL is correct (2 scored trades, needs 30 -- `0.0`
+would be a claim rather than an absence). `win_rate` 0.5 is real, and is
+literally 1 win / 2 trades since the epoch. Training is fine -- 8/8 symbols
+every hour, magnitude head rank IC 0.15-0.35, top-decile spread x1.7-2.1,
+calibration error 0.05-0.11 -> 0.00. And the equity step from 9976.18 to
+9988.22 with no trades was the fee double-count fix landing: 9988.22 is
+exactly 10000 - 11.78.
+
+Not working: `Active signals: 0` or `1`, out of 8, hour after hour.
+
+The cause is the calibration added earlier in this document. Mapping raw
+scores onto observed frequencies is correct, and the consequence is that
+`probability_up` now sits in a narrow band around 0.50, because the models
+genuinely carry about 1.5pp of edge. The `0.55 / 0.45` threshold in
+`generate_signals` was chosen when the heads emitted uncalibrated,
+overconfident probabilities. Against calibrated ones it is close to absolute.
+
+So the funnel was **8 symbols -> 0-1 past the probability threshold -> 0 past
+the EV gate**. The gate this document is about was never reached.
+
+A fixed probability threshold is also the wrong instrument in a system that
+has an EV gate. It judges `p` alone and cannot see forecast move size, so it
+blocks p=0.53 on a 2% bar while passing p=0.60 on a 0.3% one -- the same
+mistake as the constant `E|move|`, in the other direction.
+
+**Fix.** Thresholds to 0.50, so direction is `sign(p - 0.5)` and
+`is_tradeable()` is the only entry gate. Churn is held off by
+`SIGNAL_EXIT_BAND` (default 0.02) on the *exit* side instead: an open long is
+closed on signal grounds only once `p < 0.48`. Without that, entry at 0.50
+would reverse the whole book on a probability drifting across the midpoint --
+the original bleed, rebuilt.
+
+On the live probabilities from run 32730166876, candidates reaching the EV
+gate go from 2 to 8. All 8 are still refused, and that is the honest answer:
+
+| symbol | p | E&#124;move&#124; | EV | needs |
+|---|---|---|---|---|
+| XRP/USDT | 0.545 | 1.000% | -0.210% | 65.0% |
+| DOGE/USDT | 0.523 | 0.760% | -0.265% | 69.7% |
+| SOL/USDT | 0.497 | 0.570% | -0.297% | 76.3% |
+| TRX/USDT | 0.230 | 0.290% | -0.143% | 101.7% |
+
+What changed is that every symbol is now *evaluated and logged* each hour, and
+a volatility spike on any of them can carry it through. The frontier:
+
+| forecast E&#124;move&#124; | calibrated P(up) needed |
+|---|---|
+| 0.5% | 0.800 |
+| 1.0% | 0.650 |
+| 2.0% | 0.575 |
+| 3.0% | 0.550 |
+
+Trades will be rare. That is what a 0.30% round trip against a sub-1% hourly
+move costs, and no amount of threshold tuning changes it -- only a longer
+horizon or maker execution does.
+
+## Reconciliation: one pass, decided before any write
+
+The close pass and the open pass each decided independently, with a re-read of
+`paper_trades` between them, so no single place knew what the cycle intended.
+Three defects followed.
+
+**Flat and silent were the same thing.** `desired_sides()` was fed
+`active_signals`, so a symbol the model called flat produced no dict key --
+identical to one it never scored. Both closed the position, both recorded
+`no_signal`. `desired_side_by_symbol()` now takes the full frame and returns
+`None` for a flat call, absent for silence, and the two get different
+treatment: flat closes (`flat_signal`), silence *preserves*, bounded by the
+stop and `MAX_HOLDING_HOURS`. Flattening on silence would pay a round trip on
+every open position for a transient trainer or database failure.
+
+**Duplicate open rows were resolved by luck.** `desired_sides_from_trades()`
+was a dict comprehension over a query with no `.order(...)`, so with two open
+rows for one symbol the surviving side was not deterministic -- and two
+opposite-side rows could pass the `held` guard and open a third position.
+`open_by_symbol()` now returns duplicated symbols separately and the cycle
+fails closed on them. Migration 005's partial unique index remains the real
+guard; this is defense for databases provisioned from `src/data/schema.sql`,
+which had drifted and carried no such index (now fixed, with a contract test).
+
+**One failed close aborted the hour.** The `.update()` was bare inside a loop,
+so a failure propagated out of `main()` and steps [5/6] and [6/6] never ran --
+a hole in the equity curve rather than a wrong value in it. Failures are now
+contained per symbol, the portfolio row is always written, and the cycle exits
+non-zero afterwards so the step goes red instead of reporting green. The open
+path's `except Exception` was the mirror image: it reported auth, schema and
+network failures as "likely concurrent run" and swallowed them.
+`is_duplicate_open_error()` now separates a lost race from a real error.
+
+Reads of `paper_trades` per cycle: **4 -> 2**. Post-close cash, exposure and
+the final open book are derived from writes this process performed and
+confirmed. That is not just cheaper -- a re-read picks up a concurrent run's
+rows, so the allocator could size against cash another run had already
+changed, and the portfolio row could describe a book this cycle did not
+create.
+
+### exit_reason vocabulary
+
+`stop_loss`, `take_profit`, `max_holding`, `signal_flip`, `flat_signal`.
+Validated against `EXIT_REASONS` before every write, because the column is
+`VARCHAR(24)` and a longer label truncates silently. **`no_signal` is legacy**
+-- historical rows carry it, and it may mean any of "model said flat", "model
+said nothing", or "no predictions at all".
+
+## Reading the portfolio row
+
+`scored_trades` is now persisted. It was computed and printed but never
+stored, which is why a `win_rate` of 0.5 was unreadable: `total_trades` is
+lifetime while `win_rate` and `sharpe_ratio` are measured since
+`STATS_EPOCH_MS`, so the row carried no denominator for its own headline
+number. 0.5 over two trades and 0.5 over two hundred looked identical.
+
+## Migration 006: archive and restart
+
+Clearing `portfolio` alone does nothing -- every row is recomputed from
+`paper_trades` each cycle (`cash = INITIAL_CASH - locked + realized_pnl`), so
+the same equity returns within the hour. `006_archive_and_reset.sql` copies
+both tables to `*_archive`, verifies the counts, clears the originals, and
+adds `portfolio.scored_trades`. The 77 broken-era trades that docs 01-04 are
+written against are preserved, and the next cycle recomputes a clean
+$10,000.

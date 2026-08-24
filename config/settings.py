@@ -42,9 +42,13 @@ HISTORY_YEARS = 2
 
 # Trades entered before this instant were made while the pipeline was broken:
 # training failed 8/8 every hour and the engine replayed one frozen prediction
-# set, churning the same four positions and paying the spread each time. They
-# are real recorded trades but they measure the old bug, not the current
-# system, so portfolio statistics start here.
+# set, churning the same four positions and paying the spread each time.
+#
+# Migration 006 moved those 77 trades into `paper_trades_archive` and cleared
+# the live table, so nothing before this instant remains to filter. The epoch
+# is kept as a floor -- it costs nothing, and it means restoring rows from the
+# archive for analysis cannot silently contaminate `sharpe_ratio` and
+# `win_rate` again.
 #
 # 2026-08-24T00:25:00Z -- the first cycle that traded on a fresh prediction.
 STATS_EPOCH_MS = int(os.getenv("STATS_EPOCH_MS", "1787531100000"))

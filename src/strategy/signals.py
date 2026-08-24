@@ -2,8 +2,20 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_LONG_THRESHOLD = 0.55
-DEFAULT_SHORT_THRESHOLD = 0.45
+# Direction only. The thresholds used to be 0.55/0.45, chosen when the models
+# emitted uncalibrated, overconfident probabilities. Calibration maps scores
+# onto observed frequencies, and since the models carry about 1.5pp of real
+# edge, `probability_up` now sits in a narrow band around 0.50 -- so 0.55/0.45
+# fired on 0 to 1 of 8 symbols per hour and the EV gate downstream never got to
+# see a candidate.
+#
+# A fixed probability threshold is also the wrong instrument: it judges `p`
+# alone and cannot see the forecast move size, so it blocks p=0.53 on a 2% bar
+# while passing p=0.60 on a 0.3% one. `is_tradeable()` weighs both. Let it
+# decide, and keep churn in check with SIGNAL_EXIT_BAND on the way out rather
+# than with a wider band on the way in.
+DEFAULT_LONG_THRESHOLD = 0.50
+DEFAULT_SHORT_THRESHOLD = 0.50
 
 
 def generate_signals(

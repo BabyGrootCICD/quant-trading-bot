@@ -1,6 +1,8 @@
 import sys
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 
 import ccxt
 import numpy as np
@@ -55,8 +57,27 @@ VOLATILITY_LOOKBACK = 168
 # hour. The EV that justified entering was computed for a one-hour horizon;
 # holding for twenty is a different bet that nothing ever evaluated.
 MAX_HOLDING_HOURS = env_float("MAX_HOLDING_HOURS", 6)
+
+# How far the probability must cross 0.5 *against* an open position before the
+# signal alone closes it. Entry is decided by the EV gate, so the directional
+# threshold sits at 0.5 -- without a band here a probability oscillating
+# 0.499/0.501 would round-trip the whole book every hour, which is precisely
+# the churn that produced the original bleed.
+SIGNAL_EXIT_BAND = env_float("SIGNAL_EXIT_BAND", 0.02)
 STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.015)
 TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 0.02)
+
+# Every value `exit_reason` may take. The column is VARCHAR(24), so a longer
+# label would be truncated on the way in and silently mis-read on the way out.
+#
+# `no_signal` is legacy: it was written whenever the symbol was absent from
+# `wanted`, which conflated "the model said flat", "the model said nothing"
+# and "there were no predictions at all". Those are now `flat_signal` and a
+# preserved position respectively. Historical rows still carry it.
+EXIT_REASONS = frozenset({
+    "stop_loss", "take_profit", "max_holding", "signal_flip", "flat_signal",
+    "no_signal",
+})
 
 
 def create_exchange():
@@ -173,7 +194,12 @@ def is_prediction_fresh(prediction_ts_ms: int, now_ms: int, max_age_hours: int =
 
 
 def desired_sides(signals: pd.DataFrame) -> dict[str, str]:
-    """Map symbol -> desired side for the current (fresh) signal set."""
+    """Legacy signal map. Superseded by `desired_side_by_symbol()`.
+
+    Cannot represent "the model said flat": a signal of 0 produces no key, the
+    same as a symbol that was never scored. Kept only for
+    `close_open_positions()` and the tests that drive it.
+    """
     if signals is None or signals.empty:
         return {}
     out = {}
@@ -185,11 +211,217 @@ def desired_sides(signals: pd.DataFrame) -> dict[str, str]:
     return out
 
 
-def desired_sides_from_trades(open_trades: pd.DataFrame) -> dict[str, str]:
-    """Map symbol -> side for currently open positions."""
-    if open_trades is None or open_trades.empty:
+def desired_side_by_symbol(signals: pd.DataFrame) -> dict[str, str | None]:
+    """Map symbol -> "long" / "short" / None over the FULL signals frame.
+
+    The distinction this exists for: `None` means the model looked and had no
+    directional view (signal == 0), while a symbol *absent from the dict* means
+    the model never spoke for it at all. `desired_sides()` was fed
+    `active_signals`, so both arrived downstream as a missing key and both
+    forced a close -- a stale prediction and a genuine flat call were
+    indistinguishable, in the code and in the persisted `exit_reason`.
+    """
+    if signals is None or signals.empty:
         return {}
-    return {row["symbol"]: row["side"] for _, row in open_trades.iterrows()}
+    out: dict[str, str | None] = {}
+    for _, row in signals.iterrows():
+        signal = row["signal"]
+        if signal == 1:
+            out[row["symbol"]] = "long"
+        elif signal == -1:
+            out[row["symbol"]] = "short"
+        else:
+            out[row["symbol"]] = None
+    return out
+
+
+def open_by_symbol(open_trades: pd.DataFrame) -> tuple[dict[str, dict], dict[str, list]]:
+    """Split open positions into one-per-symbol, plus the symbols that have more.
+
+    `desired_sides_from_trades()` was a dict comprehension, so two open rows
+    for one symbol collapsed to whichever came last -- and `fetch_open_trades`
+    has no `.order(...)`, so *which* side survived was not deterministic. With
+    two opposite-side rows that neither trigger an exit, the surviving side
+    could then pass `build_candidates`' `held` guard and open a third
+    position. Duplicated symbols are excluded here so nothing downstream can
+    guess; the caller fails closed on them instead.
+
+    The duplicated rows are still returned, because refusing to *act* on a
+    position is not a reason to stop *counting* it -- its capital is really
+    committed, and dropping it from the portfolio mark would understate the
+    book by its whole notional.
+    """
+    if open_trades is None or open_trades.empty:
+        return {}, {}
+
+    grouped: dict[str, list[dict]] = {}
+    for _, row in open_trades.iterrows():
+        grouped.setdefault(row["symbol"], []).append(row.to_dict())
+
+    singles = {sym: rows[0] for sym, rows in grouped.items() if len(rows) == 1}
+    duplicates = {sym: rows for sym, rows in sorted(grouped.items()) if len(rows) > 1}
+    return singles, duplicates
+
+
+class Action(str, Enum):
+    KEEP = "keep"        # desired side matches; leave the row completely alone
+    CLOSE = "close"      # close, open nothing
+    OPEN = "open"        # nothing open, the signal wants a side
+    REVERSE = "reverse"  # close first, open the other side only if that succeeds
+    SKIP = "skip"        # deliberately no transition
+    ERROR = "error"      # fail closed
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What should happen to one symbol this cycle, decided before any write."""
+    symbol: str
+    action: Action
+    reason: str
+    price: float | None = None
+    current_side: str | None = None
+    desired_side: str | None = None
+    trade: dict | None = None
+    signal_row: dict | None = None
+    # Every open row for a symbol that has more than one. Carried so the
+    # portfolio still marks capital the cycle refuses to trade.
+    duplicate_rows: tuple = ()
+
+
+def signal_wants_exit(current_side: str, prob_up: float,
+                      band: float = SIGNAL_EXIT_BAND) -> bool:
+    """True when the probability has moved far enough against an open position.
+
+    Entry direction is `sign(p - 0.5)`, so without a band a probability
+    drifting across 0.5 would reverse the book every hour and pay the round
+    trip each time for no change in conviction.
+    """
+    if not np.isfinite(prob_up):
+        return False
+    if current_side == "long":
+        return prob_up < 0.5 - band
+    return prob_up > 0.5 + band
+
+
+def classify_positions(open_trades: pd.DataFrame, signals: pd.DataFrame,
+                       prices: dict[str, float], now_ms: int, *,
+                       signals_available: bool = True,
+                       exit_band: float = SIGNAL_EXIT_BAND,
+                       max_holding_hours: float = MAX_HOLDING_HOURS,
+                       stop_loss_pct: float = STOP_LOSS_PCT,
+                       take_profit_pct: float = TAKE_PROFIT_PCT) -> list[Decision]:
+    """Decide every symbol's transition before touching the database.
+
+    Pure: no client, no writes, no ordering side effects. Separating this from
+    execution is what makes the contract testable -- previously the close pass
+    and the open pass each decided independently, with a re-read of
+    `paper_trades` in between, so no single place knew what the cycle intended.
+
+    Classification decides *direction and transition* only. Whether an OPEN is
+    worth taking is still `build_candidates`' EV gate, and how large it is is
+    still `allocate()`.
+    """
+    open_map, duplicates = open_by_symbol(open_trades)
+    desired_map = desired_side_by_symbol(signals)
+
+    prob_by_symbol = {}
+    if signals is not None and not signals.empty and "probability_up" in signals.columns:
+        for _, row in signals.iterrows():
+            prob_by_symbol[row["symbol"]] = float(row["probability_up"])
+
+    signal_rows = {}
+    if signals is not None and not signals.empty:
+        for _, row in signals.iterrows():
+            signal_rows[row["symbol"]] = row.to_dict()
+
+    decisions: list[Decision] = []
+
+    for symbol, rows in duplicates.items():
+        decisions.append(Decision(symbol=symbol, action=Action.ERROR,
+                                  reason="duplicate_open",
+                                  duplicate_rows=tuple(rows)))
+
+    for symbol in sorted(set(open_map) | set(desired_map)):
+        if symbol in duplicates:
+            continue
+
+        trade = open_map.get(symbol)
+        has_signal = symbol in desired_map
+        desired = desired_map.get(symbol)
+        signal_row = signal_rows.get(symbol)
+
+        price = prices.get(symbol)
+        if price is None:
+            # No price means no honest mark, so no transition in either
+            # direction -- an existing position is left exactly as it is.
+            if trade is not None:
+                decisions.append(Decision(symbol=symbol, action=Action.SKIP,
+                                          reason="no_price", current_side=trade["side"],
+                                          trade=trade))
+            continue
+
+        if trade is not None:
+            risk = risk_exit_reason(trade, price, now_ms,
+                                    max_holding_hours=max_holding_hours,
+                                    stop_loss_pct=stop_loss_pct,
+                                    take_profit_pct=take_profit_pct)
+            if risk is not None:
+                # Checked before any signal comparison: a stop must not be
+                # overridden by a model that still likes the position.
+                decisions.append(Decision(symbol=symbol, action=Action.CLOSE,
+                                          reason=risk, price=price,
+                                          current_side=trade["side"], trade=trade))
+                continue
+
+        if not signals_available or not has_signal:
+            # The model said nothing about this symbol -- no prediction row, or
+            # the whole set was stale. Preserve the position and record no
+            # decision; the stop and MAX_HOLDING_HOURS above still bound it, so
+            # it cannot be orphaned. Flattening here would pay a round trip on
+            # every open position for a transient trainer or database failure.
+            if trade is not None:
+                decisions.append(Decision(symbol=symbol, action=Action.SKIP,
+                                          reason="no_decision", price=price,
+                                          current_side=trade["side"], trade=trade))
+            continue
+
+        if desired is None:
+            if trade is not None:
+                decisions.append(Decision(symbol=symbol, action=Action.CLOSE,
+                                          reason="flat_signal", price=price,
+                                          current_side=trade["side"], trade=trade))
+            continue
+
+        if trade is None:
+            decisions.append(Decision(symbol=symbol, action=Action.OPEN,
+                                      reason="signal", price=price,
+                                      desired_side=desired, signal_row=signal_row))
+            continue
+
+        current_side = trade["side"]
+        if desired == current_side:
+            decisions.append(Decision(symbol=symbol, action=Action.KEEP,
+                                      reason="signal_unchanged", price=price,
+                                      current_side=current_side, desired_side=desired,
+                                      trade=trade))
+            continue
+
+        prob_up = prob_by_symbol.get(symbol, float("nan"))
+        if not signal_wants_exit(current_side, prob_up, band=exit_band):
+            # The side flipped, but only just. Holding costs nothing; churning
+            # costs the round trip.
+            decisions.append(Decision(symbol=symbol, action=Action.KEEP,
+                                      reason="within_exit_band", price=price,
+                                      current_side=current_side, desired_side=desired,
+                                      trade=trade))
+            continue
+
+        decisions.append(Decision(symbol=symbol, action=Action.REVERSE,
+                                  reason="signal_flip", price=price,
+                                  current_side=current_side, desired_side=desired,
+                                  trade=trade, signal_row=signal_row))
+
+    return decisions
 
 
 def unrealized_return(side: str, entry_price: float, current_price: float) -> float:
@@ -215,16 +447,15 @@ def position_age_hours(trade, now_ms: int) -> float | None:
     return (now_ms - entry) / 3_600_000
 
 
-def exit_reason(trade, current_price: float, now_ms: int,
-                wanted: dict[str, str] | None = None,
-                max_holding_hours: float = MAX_HOLDING_HOURS,
-                stop_loss_pct: float = STOP_LOSS_PCT,
-                take_profit_pct: float = TAKE_PROFIT_PCT) -> str | None:
-    """Why this position should be closed now, or None to keep holding.
+def risk_exit_reason(trade, current_price: float, now_ms: int,
+                     max_holding_hours: float = MAX_HOLDING_HOURS,
+                     stop_loss_pct: float = STOP_LOSS_PCT,
+                     take_profit_pct: float = TAKE_PROFIT_PCT) -> str | None:
+    """Why risk alone says close this position, or None.
 
-    Risk exits are checked before the signal, because "the model still likes
-    it" is not a reason to sit through an unbounded drawdown -- and because a
-    signal that never changes is exactly the state that froze the book.
+    Deliberately knows nothing about the signal. The classifier consults this
+    *before* comparing sides, so "the model still likes it" can never keep a
+    position through an unbounded drawdown or past its forecast horizon.
     """
     side = trade["side"]
     ret = unrealized_return(side, trade["entry_price"], current_price)
@@ -238,31 +469,119 @@ def exit_reason(trade, current_price: float, now_ms: int,
     if max_holding_hours > 0 and age is not None and age >= max_holding_hours:
         return "max_holding"
 
+    return None
+
+
+def exit_reason(trade, current_price: float, now_ms: int,
+                wanted: dict[str, str] | None = None,
+                max_holding_hours: float = MAX_HOLDING_HOURS,
+                stop_loss_pct: float = STOP_LOSS_PCT,
+                take_profit_pct: float = TAKE_PROFIT_PCT) -> str | None:
+    """Legacy single-position exit rule. `main()` no longer calls this.
+
+    Superseded by `classify_positions()`, which can tell "the model said flat"
+    apart from "the model said nothing" -- a distinction this function cannot
+    make, because `wanted` is built from active signals only and both cases
+    arrive here as a missing key. Retained for `close_open_positions()` and
+    the tests that pin the risk rules directly.
+    """
+    risk = risk_exit_reason(trade, current_price, now_ms,
+                            max_holding_hours=max_holding_hours,
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct)
+    if risk is not None:
+        return risk
+
     if wanted is None:
         return "no_signal"
     desired = wanted.get(trade["symbol"])
     if desired is None:
         return "no_signal"
-    if desired != side:
+    if desired != trade["side"]:
         return "signal_flip"
 
     return None
 
 
+@dataclass(frozen=True)
+class ClosedPosition:
+    """A close this process performed and the database confirmed.
+
+    The engine keeps its own ledger of these so it can work out post-close
+    cash and exposure without re-reading `paper_trades`. A re-read would also
+    pick up a concurrent run's writes, which is exactly the race the partial
+    unique index from migration 005 exists to arbitrate.
+    """
+    symbol: str
+    trade_id: object
+    side: str
+    size: float
+    entry_price: float
+    exit_price: float
+    entry_time: object
+    exit_time: int
+    fees: float
+    net_pnl: float
+    reason: str
+
+
+def close_trade(client, trade, current_price: float, now_ms: int,
+                reason: str) -> ClosedPosition | None:
+    """Close one position. Returns None if the write failed.
+
+    The `.update()` used to be bare inside a loop: one failure propagated out
+    of `main()`, so the remaining symbols never closed *and* the portfolio row
+    for that hour was never written. A missing equity record is worse than a
+    wrong one, so a failure here is now contained to its own symbol.
+    """
+    if reason not in EXIT_REASONS:
+        # A label longer than exit_reason's VARCHAR(24), or one no reader
+        # knows, would be silently truncated or silently unrecognised.
+        raise ValueError(f"unknown exit reason {reason!r}; add it to EXIT_REASONS")
+
+    symbol = trade["symbol"]
+    side = trade["side"]
+    size = float(trade["size"])
+    entry_price = float(trade["entry_price"])
+
+    raw_pnl = unrealized_return(side, entry_price, current_price) * size
+    # Both legs: the position was opened and is now being closed.
+    fees = round_trip_cost(size)
+    net_pnl = raw_pnl - fees
+
+    try:
+        client.table("paper_trades").update({
+            "exit_price": current_price,
+            "exit_time": now_ms,
+            "pnl": round(net_pnl, 4),
+            "actual_pnl_usd": round(net_pnl, 4),
+            "fees": round(fees, 4),
+            "status": "closed",
+            "exit_reason": reason,
+        }).eq("id", trade["id"]).execute()
+    except Exception as e:
+        print(f"  ERROR closing {side} {symbol}: {e}")
+        return None
+
+    print(f"  Closed {side} {symbol} [{reason}]: entry={entry_price:.2f} "
+          f"exit={current_price:.2f} pnl=${net_pnl:.2f}")
+
+    return ClosedPosition(
+        symbol=symbol, trade_id=trade["id"], side=side, size=size,
+        entry_price=entry_price, exit_price=float(current_price),
+        entry_time=trade.get("entry_time") if hasattr(trade, "get") else None,
+        exit_time=now_ms, fees=fees, net_pnl=net_pnl, reason=reason,
+    )
+
+
 def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, float], now_ms: int,
                          wanted: dict[str, str] | None = None):
-    """Close positions the exit policy no longer wants held.
+    """Legacy close pass. `main()` now goes through `reconcile_positions()`.
 
-    `wanted` maps symbol -> side for the fresh signals. A position whose side
-    still matches is held rather than closed-and-reopened: the old code closed
-    every position every hour and paid the round trip again, which is what
-    turned a zero-information signal into a steady loss.
-
-    Passing `wanted=None` closes everything (used when no fresh signal exists).
-
-    Beyond the signal, `exit_reason()` now also applies a stop, a target and a
-    maximum holding time, so a position can no longer outlive the one-hour
-    forecast that justified opening it.
+    Kept because it is the entry point the existing exit-policy tests drive.
+    It cannot express the reconciliation contract -- `wanted` conflates "the
+    model said flat" with "the model said nothing" -- which is why it was
+    superseded rather than extended.
     """
     if open_trades.empty:
         return []
@@ -281,30 +600,8 @@ def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, fl
             print(f"  Holding {trade['side']} {symbol} (signal unchanged{age_note})")
             continue
 
-        entry_price = trade["entry_price"]
-        size = trade["size"]
-        side = trade["side"]
-
-        raw_pnl = unrealized_return(side, entry_price, current_price) * size
-
-        # Both legs: the position was opened and is now being closed.
-        fees = round_trip_cost(size)
-        net_pnl = raw_pnl - fees
-        actual_pnl_usd = net_pnl
-
-        client.table("paper_trades").update({
-            "exit_price": current_price,
-            "exit_time": now_ms,
-            "pnl": round(net_pnl, 4),
-            "actual_pnl_usd": round(actual_pnl_usd, 4),
-            "fees": round(fees, 4),
-            "status": "closed",
-            "exit_reason": reason,
-        }).eq("id", trade["id"]).execute()
-
-        closed_symbols.append(symbol)
-        print(f"  Closed {side} {symbol} [{reason}]: entry={entry_price:.2f} "
-              f"exit={current_price:.2f} pnl=${actual_pnl_usd:.2f}")
+        if close_trade(client, trade, current_price, now_ms, reason) is not None:
+            closed_symbols.append(symbol)
 
     return closed_symbols
 
@@ -392,7 +689,8 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
                        model_name: str, total_asset_usd: float, held: dict[str, str] | None = None,
                        expected_moves: dict[str, float] | None = None,
                        available_cash: float | None = None,
-                       existing_exposure: float = 0.0):
+                       existing_exposure: float = 0.0,
+                       result=None):
     """Gate on expected value, then allocate capital across what survives.
 
     Sizing used to be `risk_budget / |estimated_change|` capped at $100, per
@@ -421,31 +719,204 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
         current_price = prices[c.symbol]
         forecast = predicted_price(current_price, c.probability_up, c.expected_abs_move)
 
+        payload = {
+            "symbol": c.symbol,
+            "side": c.side,
+            "entry_price": current_price,
+            "size": round(size, 2),
+            "entry_time": now_ms,
+            "model_name": model_name,
+            "prediction_at_entry": round(c.probability_up, 4),
+            "status": "open",
+        }
         try:
-            client.table("paper_trades").insert({
-                "symbol": c.symbol,
-                "side": c.side,
-                "entry_price": current_price,
-                "size": round(size, 2),
-                "entry_time": now_ms,
-                "model_name": model_name,
-                "prediction_at_entry": round(c.probability_up, 4),
-                "status": "open",
-            }).execute()
+            client.table("paper_trades").insert(payload).execute()
         except Exception as e:
-            # A concurrent run may have already opened this symbol. The partial
-            # unique index paper_trades_one_open_per_symbol (migration 005)
-            # rejects the duplicate; skip rather than crash the run that lost
-            # the race.
-            print(f"  Skipped {c.symbol}: open insert rejected, likely concurrent run ({e})")
+            if is_duplicate_open_error(e):
+                # A concurrent run already opened this symbol. The partial
+                # unique index paper_trades_one_open_per_symbol (migration
+                # 005) rejected the duplicate; losing that race is routine.
+                print(f"  Skipped {c.symbol}: already open (unique index) -- concurrent run")
+            else:
+                # Anything else -- auth, schema drift, network -- used to be
+                # reported as "likely concurrent run" and swallowed just as
+                # quietly. Name it, and make the cycle exit non-zero.
+                print(f"  ERROR opening {c.side} {c.symbol}: {e}")
+                if result is not None:
+                    result.open_failures.append(c.symbol)
             continue
 
         opened.append(c.symbol)
+        if result is not None:
+            # The engine's local book, so the portfolio row can be built
+            # without re-reading paper_trades after writing to it.
+            result.opened.append(payload)
         print(f"  Opened {c.side} {c.symbol} @ {current_price:.2f} size=${size:.2f} "
               f"EV={c.ev*100:+.3f}% E|move|={c.expected_abs_move*100:.3f}% "
               f"P(up)={c.probability_up:.3f} -> forecast {forecast:.2f}")
 
     return opened
+
+
+_UNIQUE_MARKERS = ("23505", "duplicate key value",
+                   "paper_trades_one_open_per_symbol", "unique constraint")
+
+
+def is_duplicate_open_error(exc: Exception) -> bool:
+    """True when an insert failed because the symbol is already open.
+
+    Scans SQLSTATE, message, details and the repr rather than matching a
+    driver exception class, so it works whether PostgREST raises an APIError,
+    a dict payload, or a plain Exception. The distinction matters: a lost race
+    is routine, but an auth, schema or network failure was being reported with
+    the same "likely concurrent run" message and swallowed just as quietly.
+    """
+    parts = [
+        str(getattr(exc, "code", "")),
+        str(getattr(exc, "message", "")),
+        str(getattr(exc, "details", "")),
+        str(getattr(exc, "args", "")),
+        str(exc),
+    ]
+    blob = " ".join(parts).lower()
+    return any(marker in blob for marker in _UNIQUE_MARKERS)
+
+
+@dataclass
+class ReconcileResult:
+    """Everything this cycle decided and everything the database confirmed."""
+    decisions: list = field(default_factory=list)
+    closed: list = field(default_factory=list)
+    opened: list = field(default_factory=list)
+    kept: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    close_failures: list = field(default_factory=list)
+    open_failures: list = field(default_factory=list)
+
+    def had_errors(self) -> bool:
+        return bool(self.duplicates or self.close_failures or self.open_failures)
+
+    def exposure(self) -> float:
+        """Notional still committed after the close phase."""
+        return float(sum(float(row["size"]) for row in self.kept))
+
+    def realized_delta(self) -> float:
+        """Net PnL from the closes this cycle actually wrote."""
+        return float(sum(c.net_pnl for c in self.closed))
+
+
+def execute_decisions(client, decisions: list, prices: dict[str, float], now_ms: int, *,
+                      model_name: str, equity_before: float,
+                      expected_moves: dict[str, float] | None = None) -> ReconcileResult:
+    """Report errors, close, then open -- in that order, never interleaved.
+
+    A REVERSE's open leg is enqueued only once its close is confirmed, so a
+    failed close can never leave the book both still long and freshly short.
+    """
+    result = ReconcileResult(decisions=list(decisions))
+
+    for d in decisions:
+        if d.action is Action.ERROR:
+            result.duplicates.append(d.symbol)
+            # Counted, not traded: the capital is committed either way.
+            result.kept.extend(d.duplicate_rows)
+            sides = ", ".join(f"#{r['id']} {r['side']}" for r in d.duplicate_rows)
+            print(f"  DUPLICATE OPEN {d.symbol}: {len(d.duplicate_rows)} rows "
+                  f"({sides}). Refusing to act on it -- apply migration 005.")
+
+    # --- hold ------------------------------------------------------------
+    for d in decisions:
+        if d.action in (Action.KEEP, Action.SKIP):
+            result.kept.append(d.trade)
+            if d.action is Action.SKIP and d.reason == "no_decision":
+                print(f"  No decision for {d.symbol}: holding {d.current_side} "
+                      "(model said nothing this cycle)")
+            elif d.action is Action.SKIP and d.reason == "no_price":
+                print(f"  No price for {d.symbol}: holding {d.current_side}, no transition")
+            else:
+                age = position_age_hours(d.trade, now_ms) if d.trade else None
+                age_note = f", {age:.1f}h old" if age is not None else ""
+                note = "within exit band" if d.reason == "within_exit_band" else "signal unchanged"
+                print(f"  Holding {d.current_side} {d.symbol} ({note}{age_note})")
+
+    # --- close -----------------------------------------------------------
+    reversible = []
+    for d in decisions:
+        if d.action not in (Action.CLOSE, Action.REVERSE):
+            continue
+        closed = close_trade(client, d.trade, d.price, now_ms, d.reason)
+        if closed is None:
+            # Contained to this symbol: the position stays open in the
+            # database, so it must stay in `kept` for exposure to match, and
+            # its replacement must not be opened.
+            result.close_failures.append(d.symbol)
+            result.kept.append(d.trade)
+            continue
+        result.closed.append(closed)
+        if d.action is Action.REVERSE:
+            reversible.append(d)
+
+    # --- open ------------------------------------------------------------
+    open_decisions = [d for d in decisions if d.action is Action.OPEN] + reversible
+    if open_decisions:
+        rows = [d.signal_row for d in open_decisions if d.signal_row is not None]
+        if rows:
+            equity = equity_before + result.realized_delta()
+            exposure = result.exposure()
+            held = {row["symbol"]: row["side"] for row in result.kept if row}
+            open_new_positions(
+                client, pd.DataFrame(rows), prices, now_ms, model_name, equity,
+                held=held, expected_moves=expected_moves,
+                available_cash=max(0.0, equity - exposure),
+                existing_exposure=exposure,
+                result=result,
+            )
+
+    return result
+
+
+def reconcile_positions(client, open_trades: pd.DataFrame, signals: pd.DataFrame,
+                        prices: dict[str, float], now_ms: int, *,
+                        model_name: str, equity_before: float,
+                        expected_moves: dict[str, float] | None = None,
+                        signals_available: bool = True) -> ReconcileResult:
+    """Classify every symbol, then execute. The only thing `main()` calls.
+
+    Replaces the old unconditional close pass + re-read + open pass. The
+    re-read is gone: everything the open phase needs about the post-close book
+    is derived from writes this process performed and confirmed, so equity,
+    exposure and the portfolio row are consistent by construction rather than
+    describing a book a concurrent run may have altered mid-cycle.
+    """
+    decisions = classify_positions(open_trades, signals, prices, now_ms,
+                                   signals_available=signals_available)
+    return execute_decisions(client, decisions, prices, now_ms,
+                             model_name=model_name, equity_before=equity_before,
+                             expected_moves=expected_moves)
+
+
+def augment_history(trade_history: pd.DataFrame, closed: list) -> pd.DataFrame:
+    """Pre-close history plus this cycle's confirmed closes.
+
+    Same fields the post-close re-query used to return, so `total_pnl`,
+    `total_trades`, `filter_to_stats_epoch` and `compute_sharpe` see exactly
+    what they saw before the re-read was removed.
+    """
+    if not closed:
+        return trade_history
+    rows = [{
+        "pnl": c.net_pnl,
+        "actual_pnl_usd": c.net_pnl,
+        "size": c.size,
+        "fees": c.fees,
+        "entry_time": c.entry_time,
+        "exit_time": c.exit_time,
+        "status": "closed",
+    } for c in closed]
+    added = pd.DataFrame(rows)
+    if trade_history is None or trade_history.empty:
+        return added
+    return pd.concat([added, trade_history], ignore_index=True)
 
 
 def filter_to_stats_epoch(trade_history: pd.DataFrame, epoch_ms: int = STATS_EPOCH_MS) -> pd.DataFrame:
@@ -524,16 +995,20 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     if not open_trades.empty:
         for _, trade in open_trades.iterrows():
             symbol = trade["symbol"]
+            size = float(trade["size"])
             if symbol not in prices:
+                # No live mark. `size` has already been subtracted from cash as
+                # locked capital, so skipping the position here dropped its
+                # whole notional out of equity -- a $100 position made equity
+                # read $100 low for as long as the price fetch kept failing.
+                # Carry it at cost instead: unknown P&L, not vanished capital.
+                print(f"  No price for {symbol}: marking position at cost (${size:.2f})")
+                positions_value += size
                 continue
             current_price = prices[symbol]
             entry_price = trade["entry_price"]
-            size = trade["size"]
-            if trade["side"] == "long":
-                pnl = (current_price - entry_price) / entry_price * size
-            else:
-                pnl = (entry_price - current_price) / entry_price * size
-            positions_value += size + pnl
+            positions_value += size + unrealized_return(
+                trade["side"], entry_price, current_price) * size
 
     equity = cash_balance + positions_value
     total_asset_usd = equity
@@ -568,6 +1043,11 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
         "sharpe_ratio": round(sr, 4) if sr is not None else None,
         "win_rate": round(wr, 4) if wr is not None else None,
         "total_trades": total_trades,
+        # The denominator behind win_rate. total_trades is lifetime while
+        # win_rate and sharpe_ratio are post-epoch, so without this the row
+        # cannot be read: a win_rate of 0.5 over two trades and over two
+        # hundred look identical, and the first is noise.
+        "scored_trades": scored_trades,
     }).execute()
 
     return {"equity": equity, "cash": cash_balance, "sharpe": sr, "win_rate": wr,
@@ -647,44 +1127,45 @@ def main():
                   f"E|move|={move*100:.3f}% E[ret]={exp_ret*100:+.3f}% "
                   f"-> {forecast:.4f} (needs {breakeven_accuracy(move)*100:.1f}% accuracy)")
 
-    print("\n[4/6] Reconciling open positions...")
+    print("\n[4/6] Reconciling positions (classify -> close -> allocate -> open)...")
     open_trades = fetch_open_trades(client)
-    print(f"  Open positions: {len(open_trades)}")
-    # With no fresh signal at all, wanted={} closes everything rather than
-    # holding exposure the model can no longer justify.
-    wanted = desired_sides(active_signals)
-    close_open_positions(client, open_trades, prices, now_ms, wanted=wanted)
-
-    print("\n[5/6] Allocating capital...")
-    open_trades_after = fetch_open_trades(client)
-    held = desired_sides_from_trades(open_trades_after)
     trade_history = fetch_trade_history(client)
+    print(f"  Open positions: {len(open_trades)}")
 
     # `pnl` is already net of fees, so equity is initial capital plus realized
     # PnL -- no separate fee subtraction (that double-charge is what pushed the
     # recorded cash $11.74 below its true value).
-    total_asset_usd = INITIAL_CASH
+    equity_before = INITIAL_CASH
     if not trade_history.empty and "pnl" in trade_history.columns:
-        total_asset_usd += float(trade_history["pnl"].fillna(0).sum())
+        equity_before += float(trade_history["pnl"].fillna(0).sum())
 
-    existing_exposure = (
-        float(open_trades_after["size"].sum()) if not open_trades_after.empty else 0.0
+    # One pass: classify every symbol from the FULL signals frame before any
+    # write, then execute. `signals_available` is False when nothing fresh
+    # arrived at all, which preserves open positions rather than flattening
+    # them -- the stop and MAX_HOLDING_HOURS still bound the risk, and paying a
+    # round trip on every position for a transient trainer failure does not.
+    result = reconcile_positions(
+        client, open_trades, signals, prices, now_ms,
+        model_name=model_name, equity_before=equity_before,
+        expected_moves=expected_moves,
+        signals_available=not predictions.empty,
     )
-    available_cash = max(0.0, total_asset_usd - existing_exposure)
-    print(f"  Equity ${total_asset_usd:.2f} | committed ${existing_exposure:.2f} "
-          f"| free ${available_cash:.2f}")
 
-    if active_signals.empty:
-        print("  No fresh signals; not opening anything.")
-    else:
-        open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd,
-                           held=held, expected_moves=expected_moves,
-                           available_cash=available_cash,
-                           existing_exposure=existing_exposure)
+    print("\n[5/6] Cycle summary...")
+    committed = result.exposure() + sum(float(r["size"]) for r in result.opened)
+    print(f"  Equity ${equity_before + result.realized_delta():.2f} "
+          f"| committed ${committed:.2f} "
+          f"| held {len(result.kept)} | closed {len(result.closed)} "
+          f"| opened {len(result.opened)}")
 
     print("\n[6/6] Updating portfolio...")
-    open_trades_final = fetch_open_trades(client)
-    portfolio = update_portfolio(client, INITIAL_CASH, open_trades_final, prices, trade_history, now_ms)
+    # Built from this process's own confirmed writes rather than a re-read.
+    # A re-read would also pick up a concurrent run's rows, so the portfolio
+    # snapshot could describe a book this cycle did not create.
+    open_rows = [row for row in result.kept if row] + list(result.opened)
+    open_trades_final = pd.DataFrame(open_rows) if open_rows else pd.DataFrame()
+    portfolio = update_portfolio(client, INITIAL_CASH, open_trades_final, prices,
+                                 augment_history(trade_history, result.closed), now_ms)
     print(f"  Total Asset: ${portfolio['total_asset_usd']:.2f}")
     print(f"  Equity: ${portfolio['equity']:.2f}")
     print(f"  Cash: ${portfolio['cash']:.2f} "
@@ -702,6 +1183,23 @@ def main():
         print(f"  Win Rate: {portfolio['win_rate']:.2%} (over {scored} trades)")
     print(f"  Total Trades: {portfolio['total_trades']} "
           f"(scored since epoch: {portfolio['scored_trades']})")
+
+    # Reported after the portfolio row is written, never instead of it: a
+    # missing equity record is worse than a recorded bad hour. The non-zero
+    # exit turns the workflow step red rather than reporting green on a
+    # half-reconciled book.
+    if result.had_errors():
+        print("\n" + "=" * 60)
+        print("RECONCILE ERRORS")
+        if result.duplicates:
+            print(f"  Duplicate open rows: {', '.join(result.duplicates)} "
+                  "(apply migration 005)")
+        if result.close_failures:
+            print(f"  Failed to close: {', '.join(result.close_failures)}")
+        if result.open_failures:
+            print(f"  Failed to open: {', '.join(result.open_failures)}")
+        print("=" * 60)
+        sys.exit(1)
 
     print("\n" + "=" * 60)
     print("Paper trading cycle complete.")

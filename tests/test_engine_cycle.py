@@ -75,9 +75,12 @@ class FakeQuery:
 
     def execute(self):
         if self.op in ("insert", "update", "upsert"):
+            if self.store.fail_on == (self.table, self.op):
+                raise RuntimeError("db unavailable")
             self.store.writes.append((self.table, self.op, self.payload, dict(self.filters)))
             self.store.apply(self.table, self.op, self.payload, self.filters)
             return type("Resp", (), {"data": []})()
+        self.store.selects.append(self.table)
         return type("Resp", (), {"data": self.store.read(self.table, self.filters)})()
 
 
@@ -89,6 +92,8 @@ class FakeStore:
             "portfolio": [],
         }
         self.writes = []
+        self.selects = []
+        self.fail_on = None
         self._next_id = 100
 
     def table(self, name):
@@ -149,8 +154,9 @@ def _prediction(symbol, prob_up, move, age_h=0.5):
 
 @pytest.fixture
 def patched(monkeypatch):
-    def _run(predictions, open_trades=(), history=()):
+    def _run(predictions, open_trades=(), history=(), fail_on=None):
         store = FakeStore(predictions, open_trades, history)
+        store.fail_on = fail_on
         monkeypatch.setattr(engine, "get_client", lambda: store)
         monkeypatch.setattr(engine, "create_exchange", lambda: FakeExchange())
         monkeypatch.setattr(engine, "SYMBOLS", ["BTC/USDT", "ETH/USDT"])
@@ -268,3 +274,74 @@ def test_sharpe_is_unknown_not_zero_on_a_thin_record(patched):
 def test_no_predictions_at_all_is_not_a_crash(patched):
     store = patched([])
     assert store.data["portfolio"] == []
+
+
+# --- the cycle must not read back what it just wrote ------------------------
+
+def test_paper_trades_is_read_exactly_twice_per_cycle(patched):
+    """One open-positions read and one history read, both before any write.
+
+    The old flow re-read `paper_trades` after closing and again after opening.
+    Those re-reads pick up concurrent runs' rows, so the portfolio snapshot
+    could describe a book this cycle did not create, and the allocator could
+    size against cash a concurrent close had already changed. Everything the
+    open phase needs is derived locally from confirmed writes instead.
+    """
+    store = patched([_prediction("BTC/USDT", 0.75, 0.020)],
+                    open_trades=[_open_trade(age_h=24)])
+
+    assert store.selects.count("paper_trades") == 2
+
+
+def test_the_portfolio_row_is_written_even_when_a_close_fails(patched):
+    """A missing equity record is worse than a recorded bad hour.
+
+    The close `.update()` used to be bare, so one failure propagated out of
+    main() and steps [5/6] and [6/6] never ran -- a hole in the equity curve
+    rather than a wrong value in it.
+    """
+    with pytest.raises(SystemExit) as exc:
+        patched([_prediction("BTC/USDT", 0.75, 0.020)],
+                open_trades=[_open_trade(age_h=24)],
+                fail_on=("paper_trades", "update"))
+
+    assert exc.value.code == 1, "and the step must go red, not report green"
+
+
+def test_the_portfolio_row_survives_the_failure(patched, monkeypatch):
+    store = FakeStore([_prediction("BTC/USDT", 0.75, 0.020)], [_open_trade(age_h=24)], [])
+    store.fail_on = ("paper_trades", "update")
+    monkeypatch.setattr(engine, "get_client", lambda: store)
+    monkeypatch.setattr(engine, "create_exchange", lambda: FakeExchange())
+    monkeypatch.setattr(engine, "SYMBOLS", ["BTC/USDT", "ETH/USDT"])
+    monkeypatch.setattr(engine, "datetime", _FrozenClock)
+
+    with pytest.raises(SystemExit):
+        engine.main()
+
+    assert len(store.data["portfolio"]) == 1
+    # The position stayed open in the database, so it must still be marked.
+    assert store.portfolio_row()["positions_value"] > 0
+
+
+def test_scored_trades_is_persisted(patched):
+    """A win_rate of 0.5 over two trades and over two hundred look identical in
+    the table without its denominator."""
+    store = patched([_prediction("BTC/USDT", 0.60, 0.0022)],
+                    history=[_closed(-2.0, tid=50), _closed(3.0, tid=51)])
+    row = store.portfolio_row()
+    assert row["scored_trades"] == 2
+    assert row["win_rate"] == pytest.approx(0.5)
+
+
+def test_a_position_with_no_live_price_is_marked_at_cost(patched):
+    """Its size is already subtracted from cash as locked capital, so dropping
+    it from positions_value made equity read the full notional low for as long
+    as the price fetch kept failing. Unknown P&L is not vanished capital."""
+    store = patched([_prediction("BTC/USDT", 0.60, 0.0022)],
+                    open_trades=[_open_trade(symbol="SOL/USDT", entry=10.0, tid=9)])
+    row = store.portfolio_row()
+
+    assert row["positions_value"] == pytest.approx(100.0)
+    assert row["equity"] == pytest.approx(10_000.0)
+    assert row["equity"] == pytest.approx(row["cash"] + row["positions_value"])

@@ -25,7 +25,8 @@ REQUIRED_COLUMNS = {
     "paper_trades": ["symbol", "side", "entry_price", "size", "status", "pnl", "fees",
                      "actual_pnl_usd", "exit_reason"],
     "portfolio": ["timestamp", "equity", "cash", "positions_value", "total_pnl",
-                  "sharpe_ratio", "win_rate", "total_trades", "total_asset_usd"],
+                  "sharpe_ratio", "win_rate", "total_trades", "total_asset_usd",
+                  "scored_trades"],
 }
 
 

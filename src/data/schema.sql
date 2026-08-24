@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS features (
     skew_20 DOUBLE PRECISION,
     target_1h SMALLINT,
     target_4h SMALLINT,
+    target_move_1h DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(symbol, timestamp)
 );
@@ -59,6 +60,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     prediction DOUBLE PRECISION,
     probability_up DOUBLE PRECISION,
     confidence DOUBLE PRECISION,
+    expected_move_pct DOUBLE PRECISION,
+    expected_return_pct DOUBLE PRECISION,
+    predicted_price DOUBLE PRECISION,
+    horizon_hours INT DEFAULT 1,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(symbol, timestamp)
 );
@@ -80,9 +85,17 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     model_name VARCHAR(50),
     prediction_at_entry DOUBLE PRECISION,
     actual_pnl_usd DOUBLE PRECISION DEFAULT 0,
+    exit_reason VARCHAR(24),
     status VARCHAR(10) DEFAULT 'open',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Mirrors migration 005. Without it a database bootstrapped from this file
+-- silently lacks the guard, and the engine's duplicate-insert handler never
+-- fires because the insert simply succeeds.
+CREATE UNIQUE INDEX IF NOT EXISTS paper_trades_one_open_per_symbol
+    ON paper_trades (symbol)
+    WHERE status = 'open';
 
 CREATE TABLE IF NOT EXISTS portfolio (
     id BIGSERIAL PRIMARY KEY,
@@ -95,6 +108,9 @@ CREATE TABLE IF NOT EXISTS portfolio (
     win_rate DOUBLE PRECISION,
     total_asset_usd DOUBLE PRECISION,
     total_trades INT DEFAULT 0,
+    -- Denominator behind win_rate. total_trades is lifetime while win_rate and
+    -- sharpe_ratio are post-epoch, so the row is unreadable without it.
+    scored_trades INT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
