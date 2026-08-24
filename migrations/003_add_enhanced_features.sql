@@ -24,6 +24,20 @@ ALTER TABLE features ADD COLUMN IF NOT EXISTS vol_20 DOUBLE PRECISION;
 ALTER TABLE features ADD COLUMN IF NOT EXISTS skew_20 DOUBLE PRECISION;
 ALTER TABLE features ADD COLUMN IF NOT EXISTS target_4h SMALLINT;
 
+-- Older code inserted into `predictions` with no uniqueness guarantee, so
+-- duplicate (symbol, timestamp) rows may already exist -- and the unique index
+-- below would fail on them. Drop the older copy of each duplicate pair,
+-- keeping the highest id (the most recently written row).
+--
+-- Inspect first if you want to see what this will remove:
+--   SELECT symbol, timestamp, count(*) FROM predictions
+--   GROUP BY symbol, timestamp HAVING count(*) > 1;
+DELETE FROM predictions p
+USING predictions q
+WHERE p.symbol = q.symbol
+  AND p.timestamp = q.timestamp
+  AND p.id < q.id;
+
 -- `predictions` upserts use on_conflict="symbol,timestamp"; without this
 -- constraint PostgREST rejects them with 42P10.
 CREATE UNIQUE INDEX IF NOT EXISTS predictions_symbol_timestamp_key
