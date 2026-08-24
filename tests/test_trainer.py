@@ -199,3 +199,141 @@ def test_promotion_gate_uses_edge_not_sharpe():
     src = inspect.getsource(trainer.check_auto_upgrade)
     assert "edge_over_baseline" in src
     assert "sharpe_ratio\"] > 1" not in src
+
+
+# --- the magnitude forecast rides along on the prediction row --------------
+
+class _CandleClient(FakeClient):
+    """FakeClient that can also answer the candle lookup for predicted_price."""
+
+    def __init__(self, close=100.0):
+        super().__init__()
+        self.close = close
+
+    def table(self, name):
+        if name != "candles":
+            return super().table(name)
+        close = self.close
+
+        class _Q:
+            def select(self, *_):
+                return self
+
+            def eq(self, *_):
+                return self
+
+            def limit(self, *_):
+                return self
+
+            def execute(self):
+                return type("Resp", (), {"data": [{"close": close}]})()
+
+        return _Q()
+
+
+def _moves(values):
+    return pd.Series(values, index=[0, 1, 2])
+
+
+def test_prediction_row_carries_the_conditional_move():
+    """Without this the engine falls back to the symbol's unconditional
+    average, which is the constant that made the EV gate refuse every bar."""
+    client = _CandleClient(close=100.0)
+    trainer.upsert_latest_prediction(client, "BTC/USDT", _predictions_frame(),
+                                     "neural_v1", expected_moves=_moves([0.001, 0.002, 0.015]))
+
+    record = [c for c in client.calls if c[0] == "predictions"][0][2]
+    assert record["expected_move_pct"] == pytest.approx(0.015)
+    # P(up)=0.8 on a 1.5% move: (2*0.8-1)*0.015 = +0.9%
+    assert record["expected_return_pct"] == pytest.approx(0.009)
+    assert record["predicted_price"] == pytest.approx(100.0 * np.exp(0.009), rel=1e-6)
+    assert record["horizon_hours"] == 1
+
+
+def test_missing_magnitude_is_written_as_null_not_zero():
+    """A zero expected move reads as 'this bar cannot move', which would make
+    break-even accuracy infinite rather than unknown."""
+    client = _CandleClient()
+    trainer.upsert_latest_prediction(client, "BTC/USDT", _predictions_frame(), "neural_v1")
+
+    record = [c for c in client.calls if c[0] == "predictions"][0][2]
+    assert record["expected_move_pct"] is None
+    assert record["expected_return_pct"] is None
+    assert record["predicted_price"] is None
+
+
+def test_a_nonsense_magnitude_is_dropped_rather_than_trusted():
+    client = _CandleClient()
+    trainer.upsert_latest_prediction(client, "BTC/USDT", _predictions_frame(),
+                                     "neural_v1", expected_moves=_moves([0.01, 0.01, np.nan]))
+    record = [c for c in client.calls if c[0] == "predictions"][0][2]
+    assert record["expected_move_pct"] is None
+
+
+def test_a_failing_magnitude_head_does_not_take_training_down():
+    """Degraded (engine falls back to live volatility) beats dead."""
+    client = FakeClient()
+    df = pd.DataFrame({c: [0.0] * 10 for c in trainer.FEATURE_COLS})
+    moves, metrics = trainer.train_magnitude_head(client, "BTC/USDT", df)
+    assert moves is None
+    assert "magnitude_error" in metrics
+
+
+# --- promotion ladder -------------------------------------------------------
+
+def _metrics_rows(model_name, edge, n=8):
+    now = pd.Timestamp.now(tz="UTC")
+    return [{"model_name": model_name,
+             "sharpe_ratio": 0.0,
+             "edge_over_baseline": edge,
+             "evaluated_at": (now - pd.Timedelta(hours=i)).isoformat()}
+            for i in range(n)]
+
+
+class _MetricsClient:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def table(self, _name):
+        rows = self.rows
+
+        class _Q:
+            def select(self, *_):
+                return self
+
+            def order(self, *_, **__):
+                return self
+
+            def limit(self, *_):
+                return self
+
+            def execute(self):
+                return type("Resp", (), {"data": rows})()
+
+        return _Q()
+
+
+def test_the_ladder_climbs_to_the_neural_head_before_xgboost():
+    client = _MetricsClient(_metrics_rows(trainer.LOGISTIC_MODEL_NAME, 0.05))
+    assert trainer.check_auto_upgrade(client) == trainer.NEURAL_MODEL_NAME
+
+
+def test_the_ladder_climbs_from_neural_to_xgboost():
+    client = _MetricsClient(_metrics_rows(trainer.NEURAL_MODEL_NAME, 0.05))
+    assert trainer.check_auto_upgrade(client) == trainer.XGBOOST_MODEL_NAME
+
+
+def test_the_top_of_the_ladder_stays_put():
+    client = _MetricsClient(_metrics_rows(trainer.XGBOOST_MODEL_NAME, 0.05))
+    assert trainer.check_auto_upgrade(client) == trainer.XGBOOST_MODEL_NAME
+
+
+def test_noise_level_edge_does_not_promote():
+    """Every real head sits at +0.6pp to +2.0pp -- i.e. noise."""
+    client = _MetricsClient(_metrics_rows(trainer.LOGISTIC_MODEL_NAME, 0.008))
+    assert trainer.check_auto_upgrade(client) == trainer.LOGISTIC_MODEL_NAME
+
+
+def test_one_good_run_is_not_a_track_record():
+    rows = _metrics_rows(trainer.LOGISTIC_MODEL_NAME, 0.05, n=3)
+    assert trainer.check_auto_upgrade(_MetricsClient(rows)) == trainer.LOGISTIC_MODEL_NAME

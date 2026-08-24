@@ -6,13 +6,17 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from config.settings import SYMBOLS
+from config.settings import SYMBOLS, env_str
 from src.data.supabase_client import get_client
 from src.models.features import FEATURE_COLS
 from src.models.logistic import LogisticModel
+from src.models.magnitude import MagnitudeModel
+from src.models.neural import NeuralModel
 from src.models.xgboost_model import XGBoostModel, HAS_XGBOOST
 from src.utils.metrics import sharpe_ratio, expected_value, win_rate
-from src.strategy.economics import breakeven_accuracy
+from src.strategy.economics import (
+    breakeven_accuracy, expected_return, predicted_price, round_trip_cost_pct,
+)
 
 # Cap on how much history each training run pulls. Two years of hourly bars
 # is ~17.5k rows; this keeps the whole window without unbounded growth.
@@ -23,7 +27,28 @@ MAX_TRAINING_ROWS = 20000
 MIN_PROMOTION_EDGE = 0.02
 
 LOGISTIC_MODEL_NAME = LogisticModel.name
+NEURAL_MODEL_NAME = NeuralModel.name
 XGBOOST_MODEL_NAME = XGBoostModel.name
+
+# Promotion ladder. A rung is only climbed once the model currently in use has
+# shown a real edge over the majority baseline for a sustained stretch --
+# "the features carry signal, so a stronger learner is worth the variance".
+PROMOTION_LADDER = {
+    LOGISTIC_MODEL_NAME: NEURAL_MODEL_NAME,
+    NEURAL_MODEL_NAME: XGBOOST_MODEL_NAME,
+}
+
+# Consecutive recent evaluations that must all clear MIN_PROMOTION_EDGE.
+MIN_PROMOTION_RUNS = 7
+
+# Operator override. Set ACTIVE_MODEL to pin a model and skip the ladder.
+ACTIVE_MODEL_OVERRIDE = env_str("ACTIVE_MODEL", "")
+
+DIRECTIONAL_MODELS = {
+    LOGISTIC_MODEL_NAME: LogisticModel,
+    NEURAL_MODEL_NAME: NeuralModel,
+    XGBOOST_MODEL_NAME: XGBoostModel,
+}
 
 
 def fetch_features(client, symbol: str, max_rows: int = MAX_TRAINING_ROWS) -> pd.DataFrame:
@@ -64,7 +89,7 @@ def fetch_features(client, symbol: str, max_rows: int = MAX_TRAINING_ROWS) -> pd
     df = pd.DataFrame(all_data)
     df["timestamp"] = df["timestamp"].astype("int64")
     df = df.sort_values("timestamp").reset_index(drop=True)
-    for col in FEATURE_COLS + ["target_1h"]:
+    for col in FEATURE_COLS + ["target_1h", "target_4h", "target_move_1h"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -121,28 +146,92 @@ def out_of_sample_pnl(metrics: dict) -> list[float]:
     return [1.0 if p == y else -1.0 for p, y in zip(preds, y_true)]
 
 
-def upsert_latest_prediction(client, symbol: str, predictions: pd.DataFrame, model_name: str) -> bool:
+def latest_close(client, symbol: str, timestamp: int) -> float | None:
+    """Close of the candle the prediction was made on, for the price forecast."""
+    try:
+        resp = (
+            client.table("candles")
+            .select("close")
+            .eq("symbol", symbol)
+            .eq("timestamp", int(timestamp))
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+    if not resp.data:
+        return None
+    return float(resp.data[0]["close"])
+
+
+def upsert_latest_prediction(client, symbol: str, predictions: pd.DataFrame, model_name: str,
+                             expected_moves: pd.Series | None = None) -> bool:
     """Write the newest prediction for `symbol` to the `predictions` table.
 
     Nothing in the pipeline used to do this. The trainer computed predictions
     and discarded them, so the paper-trading engine kept re-reading one frozen
     row per symbol and churning the same positions hour after hour, paying the
     round-trip spread on a signal that never changed.
+
+    The row now also carries the magnitude head's forecast. Previously the
+    engine re-derived an expected move itself from live candles, as each
+    symbol's unconditional average -- a constant, which is what made the EV
+    gate refuse every bar. Writing the conditional forecast here means the
+    number the model produced is the number the allocator sizes on.
     """
     valid = predictions.dropna(subset=["prediction", "probability_up"])
     if valid.empty:
         return False
 
-    row = valid.sort_values("timestamp").iloc[-1]
-    client.table("predictions").upsert({
+    valid = valid.sort_values("timestamp")
+    row = valid.iloc[-1]
+    ts = int(row["timestamp"])
+    prob_up = float(row["probability_up"])
+
+    record = {
         "symbol": symbol,
-        "timestamp": int(row["timestamp"]),
+        "timestamp": ts,
         "model_name": model_name,
         "prediction": float(row["prediction"]),
-        "probability_up": float(row["probability_up"]),
+        "probability_up": prob_up,
         "confidence": float(row["confidence"]),
-    }, on_conflict="symbol,timestamp").execute()
+        "horizon_hours": 1,
+        "expected_move_pct": None,
+        "expected_return_pct": None,
+        "predicted_price": None,
+    }
+
+    if expected_moves is not None and row.name in expected_moves.index:
+        move = float(expected_moves.loc[row.name])
+        if np.isfinite(move) and move > 0:
+            record["expected_move_pct"] = round(move, 8)
+            record["expected_return_pct"] = round(expected_return(prob_up, move), 8)
+            close = latest_close(client, symbol, ts)
+            if close:
+                record["predicted_price"] = round(predicted_price(close, prob_up, move), 8)
+
+    client.table("predictions").upsert(record, on_conflict="symbol,timestamp").execute()
     return True
+
+
+def train_magnitude_head(client, symbol: str, df: pd.DataFrame) -> tuple[pd.Series | None, dict]:
+    """Fit the conditional E|move| model and score every row of `df`.
+
+    A failure here must not block the directional model: without a magnitude
+    forecast the engine falls back to its live-candle estimate, which is the
+    pre-patch behaviour -- degraded, not broken.
+    """
+    model = MagnitudeModel()
+    try:
+        metrics = model.fit_walk_forward(df)
+    except Exception as e:
+        return None, {"magnitude_error": str(e)}
+    if "error" in metrics:
+        return None, {"magnitude_error": metrics["error"]}
+    try:
+        return model.predict(df), metrics
+    except Exception as e:
+        return None, {"magnitude_error": str(e)}
 
 
 def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
@@ -159,8 +248,12 @@ def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
     if valid.empty:
         return {"symbol": symbol, **metrics, "trade_signals": 0}
 
+    expected_moves, mag_metrics = train_magnitude_head(client, symbol, df)
+    metrics.update(mag_metrics)
+
     metrics["prediction_written"] = upsert_latest_prediction(
-        client, symbol, valid, metrics.get("model_name", model.name)
+        client, symbol, valid, metrics.get("model_name", model.name),
+        expected_moves=expected_moves,
     )
 
     all_pnl = out_of_sample_pnl(metrics)
@@ -178,6 +271,7 @@ def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
     # Bulky and already summarised; do not carry into the metrics row.
     metrics.pop("oos_preds", None)
     metrics.pop("oos_y_true", None)
+    metrics.pop("oos_probas", None)
 
     return metrics
 
@@ -215,6 +309,7 @@ def train_and_evaluate(client, symbol: str, model) -> dict:
     # Bulky and already summarised; do not carry into the metrics row.
     metrics.pop("oos_preds", None)
     metrics.pop("oos_y_true", None)
+    metrics.pop("oos_probas", None)
 
     return metrics
 
@@ -256,15 +351,19 @@ def check_auto_upgrade(client) -> str:
         return LOGISTIC_MODEL_NAME
 
     current_model = recent.iloc[0]["model_name"]
+    next_model = PROMOTION_LADDER.get(current_model)
+    if next_model is None:
+        return current_model
 
-    if current_model == LOGISTIC_MODEL_NAME:
-        logistic_recent = recent[recent["model_name"] == LOGISTIC_MODEL_NAME]
-        # Gate on demonstrated edge over the majority-class baseline. Gating on
-        # sharpe_ratio promoted models on TRX's class-imbalance artifact.
-        if "edge_over_baseline" in logistic_recent.columns:
-            edge = pd.to_numeric(logistic_recent["edge_over_baseline"], errors="coerce")
-            if len(logistic_recent) >= 7 and (edge > MIN_PROMOTION_EDGE).all():
-                return XGBOOST_MODEL_NAME
+    current_recent = recent[recent["model_name"] == current_model]
+    # Gate on demonstrated edge over the majority-class baseline. Gating on
+    # sharpe_ratio promoted models on TRX's class-imbalance artifact.
+    if "edge_over_baseline" not in current_recent.columns:
+        return current_model
+
+    edge = pd.to_numeric(current_recent["edge_over_baseline"], errors="coerce")
+    if len(current_recent) >= MIN_PROMOTION_RUNS and (edge > MIN_PROMOTION_EDGE).all():
+        return next_model
 
     return current_model
 
@@ -276,21 +375,28 @@ def main():
 
     client = get_client()
 
-    active_model_name = check_auto_upgrade(client)
-    print(f"Active model: {active_model_name}")
+    if ACTIVE_MODEL_OVERRIDE:
+        active_model_name = ACTIVE_MODEL_OVERRIDE
+        print(f"Active model: {active_model_name} (pinned via ACTIVE_MODEL)")
+    else:
+        active_model_name = check_auto_upgrade(client)
+        print(f"Active model: {active_model_name}")
+
+    if active_model_name not in DIRECTIONAL_MODELS:
+        print(f"WARNING: unknown model '{active_model_name}', falling back to logistic")
+        active_model_name = LOGISTIC_MODEL_NAME
 
     if active_model_name == XGBOOST_MODEL_NAME and not HAS_XGBOOST:
         print("WARNING: xgboost not installed, falling back to logistic")
         active_model_name = LOGISTIC_MODEL_NAME
 
+    print(f"Round-trip cost: {round_trip_cost_pct()*100:.3f}% of position")
+
     all_metrics = []
     for symbol in SYMBOLS:
         print(f"\nTraining on {symbol}...")
         try:
-            if active_model_name == XGBOOST_MODEL_NAME:
-                model = XGBoostModel()
-            else:
-                model = LogisticModel()
+            model = DIRECTIONAL_MODELS[active_model_name]()
 
             metrics = train_walk_forward(client, symbol, model, n_splits=5)
             all_metrics.append(metrics)
@@ -301,6 +407,21 @@ def main():
                       f"(baseline {metrics.get('majority_baseline', 'N/A')}, "
                       f"edge {metrics.get('edge_over_baseline', 'N/A')})")
                 print(f"  Balanced accuracy: {metrics.get('balanced_accuracy', 'N/A')}")
+                print(f"  Calibration error: {metrics.get('calibration_error', 'N/A')} "
+                      f"(raw {metrics.get('calibration_error_raw', 'N/A')})")
+                if "magnitude_error" in metrics:
+                    print(f"  Magnitude head: FAILED ({metrics['magnitude_error']}) "
+                          "- engine will fall back to unconditional volatility")
+                else:
+                    print(f"  Magnitude head: rank IC {metrics.get('magnitude_rank_ic', 'N/A')}, "
+                          f"top-decile move x{metrics.get('magnitude_spread_ratio', 'N/A')}")
+                    mv = metrics.get("magnitude_baseline_move")
+                    if mv:
+                        # The gate's job is to find the bars where this number
+                        # is far above its unconditional level; at the average
+                        # bar the bar is usually unreachable.
+                        print(f"  Unconditional move {mv*100:.3f}% -> break-even accuracy "
+                              f"{breakeven_accuracy(mv)*100:.1f}%")
                 print(f"  Sharpe: {metrics.get('sharpe', 'N/A')}")
                 print(f"  Win rate: {metrics.get('win_rate', 'N/A')}")
                 print(f"  Signals: {metrics.get('total_signals', 0)}")

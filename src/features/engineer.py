@@ -172,6 +172,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         next_ret_4h > 0, 1.0, np.where(next_ret_4h < 0, 0.0, np.nan)
     )
 
+    # How *far* the next bar moves, regardless of direction. The direction
+    # label alone cannot answer whether a trade pays for its own round trip:
+    # EV = (2p - 1) * E|move| - cost needs the second term, and using each
+    # symbol's unconditional average for it makes the EV gate a constant.
+    # Flat bars are a real observation of magnitude (the move was zero), so
+    # unlike target_1h they are kept rather than left unlabelled.
+    features["target_move_1h"] = next_ret_1h.abs()
+
     features = features.replace([np.inf, -np.inf], np.nan)
     return features
 

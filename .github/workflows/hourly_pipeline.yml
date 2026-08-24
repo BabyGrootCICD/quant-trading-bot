@@ -9,6 +9,21 @@ concurrency:
   group: hourly-pipeline
   cancel-in-progress: false
 
+env:
+  # Strategy knobs, tunable from repo variables without a code change. Every
+  # one of these is read through config.settings.env_float/env_str, which
+  # treats an unset variable's empty string as "use the default" -- a bare
+  # float() on `vars.X` would crash the step for anyone who has not defined it.
+  EXECUTION_MODE: ${{ vars.EXECUTION_MODE }}      # taker (default) | maker
+  MIN_EDGE_MARGIN: ${{ vars.MIN_EDGE_MARGIN }}    # edge required over cost, default 1.0
+  KELLY_SCALE: ${{ vars.KELLY_SCALE }}            # fraction of Kelly, default 0.25
+  MAX_POSITION_FRAC: ${{ vars.MAX_POSITION_FRAC }}   # per symbol, default 0.10 of equity
+  MAX_GROSS_EXPOSURE: ${{ vars.MAX_GROSS_EXPOSURE }} # whole book, default 0.60 of equity
+  MAX_HOLDING_HOURS: ${{ vars.MAX_HOLDING_HOURS }}   # default 6
+  STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}           # default 0.015
+  TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}       # default 0.02
+  ACTIVE_MODEL: ${{ vars.ACTIVE_MODEL }}             # pin a model, else the promotion ladder
+
 jobs:
   pipeline:
     runs-on: ubuntu-latest
@@ -21,6 +36,13 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Cheap, offline, and catches a broken model/allocator contract before
+      # anything touches the database or the book. The outage that started all
+      # of this was an interface break (`fit_walk_forward` missing on the
+      # promoted model) that no step ever checked for.
+      - name: Unit tests
+        run: pip install pytest && python -m pytest tests -q
 
       - name: Schema preflight
         run: python -m src.data.schema_check

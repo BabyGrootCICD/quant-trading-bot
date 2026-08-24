@@ -7,6 +7,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 
+from src.models.calibration import ProbabilityCalibrator, calibration_error
 from src.models.features import FEATURE_COLS
 
 MODEL_DIR = Path(__file__).parent / "checkpoints"
@@ -20,6 +21,11 @@ class LogisticModel:
             C=C, penalty=penalty, solver=solver, max_iter=max_iter, class_weight="balanced"
         )
         self.scaler = StandardScaler()
+        # class_weight="balanced" deliberately shifts the decision threshold,
+        # which is fine for accuracy and wrong for anything that reads
+        # predict_proba as a probability. The EV gate and Kelly sizing both
+        # do, so the raw score is mapped back onto observed frequencies.
+        self.calibrator = ProbabilityCalibrator()
         self.is_fitted = False
         self.best_params = None
 
@@ -63,6 +69,10 @@ class LogisticModel:
         all_probas = np.array(all_probas)
         all_y_true = np.array(all_y_true)
 
+        raw_ece = calibration_error(all_probas, all_y_true)
+        self.calibrator.fit(all_probas, all_y_true)
+        cal_ece = calibration_error(self.calibrator.transform(all_probas), all_y_true)
+
         train_acc = np.mean(all_preds == all_y_true)
 
         up_mask = all_preds == 1
@@ -85,6 +95,10 @@ class LogisticModel:
             # an honest 0.52 accuracy got reported as a 0.91 win rate.
             "oos_preds": all_preds.tolist(),
             "oos_y_true": all_y_true.tolist(),
+            "oos_probas": all_probas.tolist(),
+            "calibration_error_raw": round(float(raw_ece), 4),
+            "calibration_error": round(float(cal_ece), 4),
+            "calibration_rows": self.calibrator.n_rows,
             "model_name": self.name,
             "train_rows": train_rows,
             "test_rows": test_rows,
@@ -197,8 +211,8 @@ class LogisticModel:
         X_clean[~mask] = 0
 
         X_scaled = self.scaler.transform(X_clean)
-        proba = self.model.predict_proba(X_scaled)[:, 1]
-        preds = self.model.predict(X_scaled)
+        proba = self.calibrator.transform(self.model.predict_proba(X_scaled)[:, 1])
+        preds = (proba > 0.5).astype(float)
 
         result = df[["symbol", "timestamp"]].copy()
         result["prediction"] = preds
@@ -211,7 +225,8 @@ class LogisticModel:
         path = path or MODEL_DIR / f"{self.name}.pkl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"model": self.model, "scaler": self.scaler, "best_params": self.best_params}, f)
+            pickle.dump({"model": self.model, "scaler": self.scaler,
+                         "best_params": self.best_params, "calibrator": self.calibrator}, f)
 
     def load(self, path: Path | None = None):
         path = path or MODEL_DIR / f"{self.name}.pkl"
@@ -220,4 +235,6 @@ class LogisticModel:
         self.model = data["model"]
         self.scaler = data["scaler"]
         self.best_params = data.get("best_params")
+        self.calibrator = data.get("calibrator", ProbabilityCalibrator())
+        self.is_fitted = True
         self.is_fitted = True

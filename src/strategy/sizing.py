@@ -1,3 +1,15 @@
+"""Legacy single-position sizers. Not used by the trading engine.
+
+`src/strategy/allocation.py` replaced these. `percentage_based_size()` in
+particular sized *inversely* to the predicted move -- it divides by
+`estimated_change_pct`, so the least convincing setups drew the most capital --
+considered each symbol in isolation with no shared budget, and ignored
+available cash entirely.
+
+Kept because they are still referenced by notebooks and older analyses. Do not
+wire them back into the engine.
+"""
+
 import numpy as np
 
 

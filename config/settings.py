@@ -3,6 +3,30 @@ from dotenv import load_dotenv
 
 load_dotenv(override=False)
 
+def env_float(name: str, default: float) -> float:
+    """Float from the environment, treating blank as unset.
+
+    GitHub Actions substitutes an *empty string* for an undefined `vars.X`, so
+    a plain `float(os.getenv(...))` on a tuning knob that has never been set in
+    the repo raises ValueError and takes the whole step down.
+    """
+    raw = os.getenv(name, "")
+    raw = raw.strip() if raw else ""
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not a number; using {default}")
+        return float(default)
+
+
+def env_str(name: str, default: str) -> str:
+    raw = os.getenv(name, "")
+    raw = raw.strip() if raw else ""
+    return raw or default
+
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
