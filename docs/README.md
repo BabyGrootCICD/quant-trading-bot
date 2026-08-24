@@ -14,6 +14,7 @@ Read them in order; each builds on the one before.
 | 04 | [Silent failure patterns](04-silent-failures.md) | Five distinct ways this codebase reported success while doing nothing, and the guards now in place |
 | 05 | [Operations](05-operations.md) | Running the pipeline, applying migrations, reading the output, known constraints |
 | 06 | [EV allocation](06-ev-allocation.md) | Why "correctly refuses to trade" became "never trades and never exits", and the magnitude head, calibration, exit policy and Kelly allocator that fix it |
+| 07 | [Why no trades](07-why-no-trades.md) | The measurement everything hinges on: no directional edge survives its own error bar at any horizon, so zero trades is the correct output |
 
 ## The one-paragraph version
 
@@ -37,3 +38,17 @@ model (volatility is forecastable even when direction is not), calibration of
 both heads, an exit policy, and expected-value position sizing. The gate now
 admits roughly 1% of bars -- the ones where the edge can actually pay for its
 own execution -- instead of none.
+
+
+## Where it ended up
+
+The pipeline is correct and the strategy has no alpha. Those are separate
+facts and both are load-bearing. Document 07 measures the second one directly:
+across six pairs and four horizons, every edge estimate sits inside one
+standard error of zero once overlapping labels are accounted for, and the
+apparent per-symbol spread grows exactly as the effective sample shrinks --
+the signature of noise.
+
+So the EV gate refuses everything, and that is the correct output rather than
+a bug to be tuned away. Weakening it would reproduce the bleed in document 01
+deliberately.
