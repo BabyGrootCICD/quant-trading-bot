@@ -25,7 +25,10 @@ ALTER TABLE predictions ADD COLUMN IF NOT EXISTS horizon_hours INT DEFAULT 1;
 
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(24);
 
--- `upsert_latest_prediction()` targets on_conflict="symbol,timestamp"; without
--- this constraint PostgREST rejects the upsert outright.
-CREATE UNIQUE INDEX IF NOT EXISTS predictions_symbol_timestamp_key
-    ON predictions(symbol, timestamp);
+-- Note: the UNIQUE(symbol, timestamp) that prediction upserts depend on was
+-- already created by 003; nothing to add here.
+
+-- features.target_move_1h lands NULL on every existing row. The feature
+-- engineer re-upserts the full history each run and it runs before the
+-- trainer, so the backfill completes in the same pipeline pass -- the
+-- magnitude head has its label by the time training starts.
