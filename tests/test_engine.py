@@ -233,11 +233,29 @@ def test_sharpe_of_constant_pnl_is_zero_not_huge():
 
 
 def test_sharpe_handles_empty_history():
-    assert engine.compute_sharpe(pd.DataFrame()) == 0.0
+    assert engine.compute_sharpe(pd.DataFrame()) is None
 
 
 def test_sharpe_handles_missing_size_column():
-    assert engine.compute_sharpe(pd.DataFrame({"pnl": [1.0, 2.0]})) == 0.0
+    assert engine.compute_sharpe(pd.DataFrame({"pnl": [1.0, 2.0]})) is None
+
+
+# --- unknown is not zero ---------------------------------------------------
+
+def test_sharpe_is_unknown_below_the_minimum_trade_count():
+    """0.0 is a claim ("no risk-adjusted return"); too-few-trades is not."""
+    from src.utils.metrics import MIN_SHARPE_TRADES
+    assert engine.compute_sharpe(_history(n=MIN_SHARPE_TRADES - 1, pnl=1.0)) is None
+
+
+def test_sharpe_becomes_a_number_once_enough_trades_exist():
+    from src.utils.metrics import MIN_SHARPE_TRADES
+    varied = pd.DataFrame({
+        "pnl": [1.0 if i % 2 else -0.5 for i in range(MIN_SHARPE_TRADES)],
+        "size": [100.0] * MIN_SHARPE_TRADES,
+        "exit_time": [NOW - i * 3_600_000 for i in range(MIN_SHARPE_TRADES)],
+    })
+    assert isinstance(engine.compute_sharpe(varied), float)
 
 
 def test_history_limit_is_not_a_silent_500_cap():

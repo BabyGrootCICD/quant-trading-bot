@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
+from src.models.calibration import ProbabilityCalibrator, calibration_error
 from src.models.features import FEATURE_COLS
 
 MODEL_DIR = Path(__file__).parent / "checkpoints"
@@ -34,6 +35,7 @@ class XGBoostModel:
             random_state=42,
         )
         self.scaler = StandardScaler()
+        self.calibrator = ProbabilityCalibrator()
         self.is_fitted = False
 
     def fit(self, df: pd.DataFrame) -> dict:
@@ -96,6 +98,7 @@ class XGBoostModel:
 
         tscv = TimeSeriesSplit(n_splits=n_splits)
         all_preds = []
+        all_probas = []
         all_y_true = []
 
         for train_idx, test_idx in tscv.split(X):
@@ -108,12 +111,18 @@ class XGBoostModel:
             self.model.fit(X_train_scaled, y_train)
 
             all_preds.extend(self.model.predict(X_test_scaled))
+            all_probas.extend(self.model.predict_proba(X_test_scaled)[:, 1])
             all_y_true.extend(y_test)
 
         self.is_fitted = True
 
         all_preds = np.array(all_preds)
+        all_probas = np.array(all_probas, dtype=float)
         all_y_true = np.array(all_y_true)
+
+        raw_ece = calibration_error(all_probas, all_y_true)
+        self.calibrator.fit(all_probas, all_y_true)
+        cal_ece = calibration_error(self.calibrator.transform(all_probas), all_y_true)
 
         acc = float(np.mean(all_preds == all_y_true))
 
@@ -144,6 +153,10 @@ class XGBoostModel:
             # an honest 0.52 accuracy got reported as a 0.91 win rate.
             "oos_preds": all_preds.tolist(),
             "oos_y_true": all_y_true.tolist(),
+            "oos_probas": all_probas.tolist(),
+            "calibration_error_raw": round(float(raw_ece), 4),
+            "calibration_error": round(float(cal_ece), 4),
+            "calibration_rows": self.calibrator.n_rows,
         }
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -156,8 +169,8 @@ class XGBoostModel:
         X_clean[~mask] = 0
 
         X_scaled = self.scaler.transform(X_clean)
-        proba = self.model.predict_proba(X_scaled)[:, 1]
-        preds = self.model.predict(X_scaled)
+        proba = self.calibrator.transform(self.model.predict_proba(X_scaled)[:, 1])
+        preds = (proba > 0.5).astype(float)
 
         result = df[["symbol", "timestamp"]].copy()
         result["prediction"] = preds
@@ -170,7 +183,8 @@ class XGBoostModel:
         path = path or MODEL_DIR / f"{self.name}.pkl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"model": self.model, "scaler": self.scaler}, f)
+            pickle.dump({"model": self.model, "scaler": self.scaler,
+                         "calibrator": self.calibrator}, f)
 
     def load(self, path: Path | None = None):
         path = path or MODEL_DIR / f"{self.name}.pkl"
@@ -178,4 +192,5 @@ class XGBoostModel:
             data = pickle.load(f)
         self.model = data["model"]
         self.scaler = data["scaler"]
+        self.calibrator = data.get("calibrator", ProbabilityCalibrator())
         self.is_fitted = True

@@ -111,9 +111,31 @@ The first attempt applied the epoch to everything, which produced
 `total_pnl 0` next to `equity 9978.93` — reading as "no losses" on an account
 down $21. Accounting facts and quality measures need different treatment.
 
-The engine now also reports `Total Trades: 75 (scored since epoch: 0)` and says
-plainly when nothing has been scored yet, so zeros are legible rather than
-alarming.
+The engine now also reports `Total Trades: 75 (scored since epoch: 0)` so the
+two scopes are visible side by side.
+
+## 5. "Unknown" was being written as 0.0
+
+The first version of the epoch change wrote `sharpe_ratio = 0` and
+`win_rate = 0` whenever there was not enough data to compute them. That is a
+different claim: 0.0 means "no risk-adjusted return", not "not enough trades
+yet". Rows 21-25 of the `portfolio` table all read `0`, which looks
+indistinguishable from a broken metric.
+
+It also would not have resolved on its own. `sharpe_ratio()` needs
+`MIN_SHARPE_TRADES` (30) observations, and the EV gate correctly blocks nearly
+every trade — so 30 closed post-epoch trades may never accumulate, and that
+column would have read `0.0000` indefinitely.
+
+**Fix.** Both columns are nullable, so undefined metrics are written as SQL
+`NULL`, and the log distinguishes the cases:
+
+```
+Sharpe: n/a (1/30 scored trades needed)
+Win Rate: n/a (no trades closed since the stats epoch)
+```
+
+A `NULL` in those columns means "not computable yet". A `0` means zero.
 
 ## A worked example: when a real edge still isn't alpha
 

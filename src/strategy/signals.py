@@ -4,7 +4,6 @@ import pandas as pd
 
 DEFAULT_LONG_THRESHOLD = 0.55
 DEFAULT_SHORT_THRESHOLD = 0.45
-DEFAULT_MAX_CHANGE_PCT = 0.02
 
 
 def generate_signals(
@@ -21,7 +20,12 @@ def generate_signals(
     signals.loc[long_mask, "signal"] = 1
     signals.loc[short_mask, "signal"] = -1
 
-    signals["estimated_change_pct"] = (signals["probability_up"] - 0.5) * 2 * DEFAULT_MAX_CHANGE_PCT
+    # `estimated_change_pct = (p - 0.5) * 2 * 0.02` used to be produced here: a
+    # fabricated linear map with a hardcoded 2% ceiling, unrelated to any
+    # symbol's volatility, which the old sizer then *divided* by. The expected
+    # move now comes from the magnitude head on the prediction row (see
+    # src/models/magnitude.py); leaving the fake column in place invited
+    # something downstream to pick it up again.
 
     signals["signal_strength"] = np.where(
         signals["signal"] == 1,

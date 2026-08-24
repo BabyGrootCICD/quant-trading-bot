@@ -2,6 +2,11 @@ import numpy as np
 
 HOURS_PER_YEAR = 8760
 
+# Below this many observations a Sharpe ratio is noise. Callers should report
+# it as unknown rather than as 0.0 -- 0.0 is a real value meaning "no
+# risk-adjusted return", which is a different claim from "not enough data".
+MIN_SHARPE_TRADES = 30
+
 
 def expected_value(pnl_series: list[float]) -> float:
     if not pnl_series:
@@ -9,7 +14,8 @@ def expected_value(pnl_series: list[float]) -> float:
     return float(np.mean(pnl_series))
 
 
-def sharpe_ratio(returns: list[float], periods_per_year: int = HOURS_PER_YEAR, min_trades: int = 30) -> float:
+def sharpe_ratio(returns: list[float], periods_per_year: int = HOURS_PER_YEAR,
+                 min_trades: int = MIN_SHARPE_TRADES) -> float:
     """Annualized Sharpe.
 
     `returns` must be *fractional returns per period*, not dollar PnL --

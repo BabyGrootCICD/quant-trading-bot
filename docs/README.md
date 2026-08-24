@@ -13,6 +13,7 @@ Read them in order; each builds on the one before.
 | 03 | [Metrics integrity](03-metrics-integrity.md) | Every way the reported numbers were lying: in-sample scoring, class imbalance, dollar-PnL Sharpe, legacy contamination |
 | 04 | [Silent failure patterns](04-silent-failures.md) | Five distinct ways this codebase reported success while doing nothing, and the guards now in place |
 | 05 | [Operations](05-operations.md) | Running the pipeline, applying migrations, reading the output, known constraints |
+| 06 | [EV allocation](06-ev-allocation.md) | Why "correctly refuses to trade" became "never trades and never exits", and the magnitude head, calibration, exit policy and Kelly allocator that fix it |
 
 ## The one-paragraph version
 
@@ -26,3 +27,13 @@ fixing the chain, a second question surfaced: at a 1h horizon, with a 0.30%
 round trip against a 0.22% mean hourly move, **BTC needs 118% accuracy to
 break even**. The pipeline now works and the bot correctly refuses to trade.
 It has no demonstrated edge.
+
+That refusal then became its own failure. The EV gate scored every bar against
+its symbol's *unconditional* average move -- one constant per symbol -- so it
+was not a filter at all, and the bot opened nothing for a day while holding two
+positions it had no rule to release; equity froze and fees were being billed
+twice on top. Document 06 covers the second round: a conditional magnitude
+model (volatility is forecastable even when direction is not), calibration of
+both heads, an exit policy, and expected-value position sizing. The gate now
+admits roughly 1% of bars -- the ones where the edge can actually pay for its
+own execution -- instead of none.

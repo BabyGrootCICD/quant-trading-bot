@@ -13,9 +13,13 @@ import pytest
 
 from src.models.features import FEATURE_COLS
 from src.models.logistic import LogisticModel
+from src.models.neural import NeuralModel
 from src.models.xgboost_model import XGBoostModel, HAS_XGBOOST
 
-MODELS = [LogisticModel] + ([XGBoostModel] if HAS_XGBOOST else [])
+# Every directional head the trainer can select has to satisfy the same
+# interface -- that contract is what broke when xgboost_v1 was promoted without
+# a fit_walk_forward(), and the neural head is now on the same ladder.
+MODELS = [LogisticModel, NeuralModel] + ([XGBoostModel] if HAS_XGBOOST else [])
 
 
 def _training_frame(n: int = 800) -> pd.DataFrame:
@@ -78,3 +82,50 @@ def test_walk_forward_exposes_out_of_sample_predictions(model_cls):
     # And they must agree with the reported accuracy.
     agree = sum(1 for p, y in zip(metrics["oos_preds"], metrics["oos_y_true"]) if p == y)
     assert agree / len(metrics["oos_preds"]) == pytest.approx(metrics["test_accuracy"], abs=1e-4)
+
+
+# --- calibrated probabilities ----------------------------------------------
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_probabilities_are_calibrated_before_they_leave_the_model(model_cls):
+    """EV, the Kelly fraction and the allocation all read probability_up as a
+    real probability. An uncalibrated score does not just mislabel a signal, it
+    mis-sizes every position taken on it."""
+    model = model_cls()
+    metrics = model.fit_walk_forward(_training_frame(1200), n_splits=3)
+    assert "calibration_error" in metrics
+    assert metrics["calibration_error"] <= metrics["calibration_error_raw"] + 1e-9
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_predicted_probabilities_stay_in_range(model_cls):
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=3)
+    preds = model.predict(_training_frame(1200))
+    probs = preds["probability_up"].dropna()
+    assert len(probs) > 0
+    assert probs.between(0.0, 1.0).all()
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_direction_agrees_with_the_calibrated_probability(model_cls):
+    """`prediction` used to come from the raw classifier while
+    `probability_up` came from the calibrator, so the two could disagree and
+    the engine would take a side its own probability argued against."""
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=3)
+    preds = model.predict(_training_frame(1200)).dropna(subset=["prediction"])
+    agrees = (preds["prediction"] == 1) == (preds["probability_up"] > 0.5)
+    assert agrees.all()
+
+
+def test_the_registry_can_build_every_model_it_lists():
+    """MODEL_REGISTRY said "logistic_v1" while LogisticModel.name was
+    "logistic_v2", so get_model(LogisticModel.name) raised ValueError."""
+    from src.models import MODEL_REGISTRY, get_model
+
+    for name, cls in MODEL_REGISTRY.items():
+        assert name == cls.name
+        if cls is XGBoostModel and not HAS_XGBOOST:
+            continue
+        assert isinstance(get_model(name), cls)

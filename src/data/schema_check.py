@@ -16,10 +16,14 @@ from src.data.supabase_client import get_client
 from src.models.features import FEATURE_COLS
 
 REQUIRED_COLUMNS = {
-    "features": FEATURE_COLS + ["symbol", "timestamp", "target_1h", "target_4h"],
+    "features": FEATURE_COLS + ["symbol", "timestamp", "target_1h", "target_4h",
+                                "target_move_1h"],
     "candles": ["symbol", "timestamp", "open", "high", "low", "close", "volume"],
-    "predictions": ["symbol", "timestamp", "model_name", "prediction", "probability_up", "confidence"],
-    "paper_trades": ["symbol", "side", "entry_price", "size", "status", "pnl", "fees", "actual_pnl_usd"],
+    "predictions": ["symbol", "timestamp", "model_name", "prediction", "probability_up",
+                    "confidence", "expected_move_pct", "expected_return_pct",
+                    "predicted_price", "horizon_hours"],
+    "paper_trades": ["symbol", "side", "entry_price", "size", "status", "pnl", "fees",
+                     "actual_pnl_usd", "exit_reason"],
     "portfolio": ["timestamp", "equity", "cash", "positions_value", "total_pnl",
                   "sharpe_ratio", "win_rate", "total_trades", "total_asset_usd"],
 }
