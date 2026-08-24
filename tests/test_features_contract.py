@@ -138,3 +138,40 @@ def test_nan_features_are_sent_as_explicit_nulls():
     # And every record in the batch must carry identical keys.
     key_sets = {frozenset(r.keys()) for r in batch}
     assert len(key_sets) == 1, "PostgREST requires uniform keys across a batch"
+
+
+def test_smallint_targets_are_sent_as_ints():
+    """`np.where` made targets 1.0/0.0 floats; Postgres rejects those for SMALLINT."""
+    import src.features.engineer as eng
+
+    captured = {}
+
+    class FakeTable:
+        def upsert(self, batch, on_conflict=None):
+            captured["batch"] = batch
+            return self
+
+        def execute(self):
+            return type("Resp", (), {"data": []})()
+
+    class FakeClient:
+        def table(self, name):
+            return FakeTable()
+
+    eng.upsert_features(FakeClient(), "BTC/USDT", engineer_features(_synthetic_candles(200)))
+
+    for col in ("target_1h", "target_4h"):
+        vals = [r[col] for r in captured["batch"] if r.get(col) is not None]
+        assert vals, f"{col} should have some labelled rows"
+        assert all(isinstance(v, int) and not isinstance(v, bool) for v in vals), \
+            f"{col} must be int for a SMALLINT column, got {set(map(type, vals))}"
+
+
+def test_float_features_stay_floats():
+    """Only the declared SMALLINT columns get cast."""
+    from src.features.engineer import _clean_value
+    assert _clean_value(0.5, "atr_14") == 0.5
+    assert isinstance(_clean_value(0.5, "atr_14"), float)
+    assert _clean_value(1.0, "target_1h") == 1
+    assert isinstance(_clean_value(1.0, "target_1h"), int)
+    assert _clean_value(float("nan"), "target_1h") is None

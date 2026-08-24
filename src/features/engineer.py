@@ -176,7 +176,13 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def _clean_value(v):
+# Columns declared SMALLINT in the schema. They are carried as floats in the
+# DataFrame so that "no label" can be NaN, but Postgres rejects "0.0" for a
+# smallint, so they must be cast back on the way out.
+INT_COLUMNS = {"target_1h", "target_4h"}
+
+
+def _clean_value(v, column: str | None = None):
     if v is None:
         return None
     if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
@@ -184,7 +190,9 @@ def _clean_value(v):
     if isinstance(v, (np.integer,)):
         return int(v)
     if isinstance(v, (np.floating,)):
-        return float(v)
+        v = float(v)
+    if column in INT_COLUMNS and isinstance(v, float):
+        return int(v)
     return v
 
 
@@ -200,7 +208,7 @@ def upsert_features(client, symbol: str, features: pd.DataFrame) -> int:
         # unlabelled flat bars kept their old target_1h = 0 and TRX's class
         # balance never actually changed. Explicit keys also keep every record
         # in a batch structurally identical, which PostgREST requires.
-        rec = {k: _clean_value(v) for k, v in r.items() if k != "id"}
+        rec = {k: _clean_value(v, k) for k, v in r.items() if k != "id"}
         clean_records.append(rec)
 
     if not clean_records:
@@ -234,16 +242,25 @@ def main():
     client = get_client()
 
     total = 0
+    failures = []
     for symbol in SYMBOLS:
         try:
             count = process_symbol(client, symbol)
             total += count
         except Exception as e:
             print(f"  ERROR processing {symbol}: {e}")
+            failures.append(symbol)
 
     print("=" * 60)
     print(f"Done. Total feature rows: {total}")
     print("=" * 60)
+
+    # Writing zero rows means the features table is frozen and everything
+    # downstream is training on stale data. That silence is what let the
+    # original outage run for a day; fail the pipeline instead.
+    if failures:
+        print(f"FATAL: {len(failures)}/{len(SYMBOLS)} symbols failed: {', '.join(failures)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
