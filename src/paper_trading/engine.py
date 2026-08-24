@@ -282,16 +282,24 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
             print(f"  Skipped {symbol}: size too small (${size:.2f})")
             continue
 
-        client.table("paper_trades").insert({
-            "symbol": symbol,
-            "side": side,
-            "entry_price": current_price,
-            "size": round(size, 2),
-            "entry_time": now_ms,
-            "model_name": model_name,
-            "prediction_at_entry": round(float(row["probability_up"]), 4),
-            "status": "open",
-        }).execute()
+        try:
+            client.table("paper_trades").insert({
+                "symbol": symbol,
+                "side": side,
+                "entry_price": current_price,
+                "size": round(size, 2),
+                "entry_time": now_ms,
+                "model_name": model_name,
+                "prediction_at_entry": round(float(row["probability_up"]), 4),
+                "status": "open",
+            }).execute()
+        except Exception as e:
+            # A concurrent run may have already opened this symbol. The partial
+            # unique index paper_trades_one_open_per_symbol (migration 004)
+            # rejects the duplicate; treat it as already-open and skip rather
+            # than crash the pipeline run that lost the race.
+            print(f"  Skipped {symbol}: open insert rejected, likely concurrent run ({e})")
+            continue
 
         print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
 
