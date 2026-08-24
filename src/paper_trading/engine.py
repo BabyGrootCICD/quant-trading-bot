@@ -12,6 +12,14 @@ from src.data.supabase_client import get_client
 from src.strategy.signals import generate_signals
 from src.strategy.sizing import calculate_position_size
 from src.utils.metrics import sharpe_ratio, win_rate
+from src.paper_trading.reconcile import (
+    plan_reconciliation,
+    KEEP,
+    CLOSE,
+    OPEN,
+    REVERSE,
+    ERROR,
+)
 
 INITIAL_CASH = 10000.0
 TAKER_FEE = 0.001
@@ -85,80 +93,97 @@ def fetch_portfolio_history(client, limit: int = 168) -> pd.DataFrame:
     return pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
 
 
-def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, float], now_ms: int):
-    if open_trades.empty:
-        return
-
-    for _, trade in open_trades.iterrows():
-        symbol = trade["symbol"]
-        if symbol not in prices:
-            continue
-
-        current_price = prices[symbol]
-        entry_price = trade["entry_price"]
-        size = trade["size"]
-        side = trade["side"]
-
-        if side == "long":
-            raw_pnl = (current_price - entry_price) / entry_price * size
-        else:
-            raw_pnl = (entry_price - current_price) / entry_price * size
-
-        fees = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
-        net_pnl = raw_pnl - fees
-        actual_pnl_usd = net_pnl
-
-        client.table("paper_trades").update({
-            "exit_price": current_price,
-            "exit_time": now_ms,
-            "pnl": round(net_pnl, 4),
-            "actual_pnl_usd": round(actual_pnl_usd, 4),
-            "fees": round(fees, 4),
-            "status": "closed",
-        }).eq("id", trade["id"]).execute()
-
-        print(f"  Closed {side} {symbol}: entry={entry_price:.2f} exit={current_price:.2f} pnl=${actual_pnl_usd:.2f}")
+# ── Position reconciliation (issue #3) ────────────────────────────────────────
+# Replaces the previous "close everything, then open from signals" flow, which
+# paid a round-trip fee whenever a position's direction was unchanged.
+# Pure classification lives in reconcile.py; the executors below do the DB writes.
 
 
-def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str, total_asset_usd: float):
-    if signals.empty:
-        return
+def _close_trade(client, trade, current_price: float, now_ms: int) -> bool:
+    entry_price = trade["entry_price"]
+    size = trade["size"]
+    side = trade["side"]
 
-    for _, row in signals.iterrows():
-        symbol = row["symbol"]
-        if symbol not in prices:
-            continue
+    if side == "long":
+        raw_pnl = (current_price - entry_price) / entry_price * size
+    else:
+        raw_pnl = (entry_price - current_price) / entry_price * size
 
-        signal = row["signal"]
-        if signal == 0:
-            continue
+    fees = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
+    net_pnl = raw_pnl - fees
 
-        side = "long" if signal == 1 else "short"
-        current_price = prices[symbol]
-        estimated_change_pct = row.get("estimated_change_pct", 0.0)
-        size = calculate_position_size(
-            row["signal_strength"],
-            method="percentage",
-            estimated_change_pct=estimated_change_pct,
-            total_asset_usd=total_asset_usd,
-        )
+    client.table("paper_trades").update({
+        "exit_price": current_price,
+        "exit_time": now_ms,
+        "pnl": round(net_pnl, 4),
+        "actual_pnl_usd": round(net_pnl, 4),
+        "fees": round(fees, 4),
+        "status": "closed",
+    }).eq("id", trade["id"]).execute()
 
-        if size < 1.0:
-            print(f"  Skipped {symbol}: size too small (${size:.2f})")
-            continue
+    print(f"  Closed {side} {trade['symbol']}: entry={entry_price:.2f} exit={current_price:.2f} pnl=${net_pnl:.2f}")
+    return True
 
-        client.table("paper_trades").insert({
-            "symbol": symbol,
-            "side": side,
-            "entry_price": current_price,
-            "size": round(size, 2),
-            "entry_time": now_ms,
-            "model_name": model_name,
-            "prediction_at_entry": round(float(row["probability_up"]), 4),
-            "status": "open",
-        }).execute()
 
-        print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
+def _open_position(client, symbol: str, side: str, row, current_price: float,
+                   now_ms: int, model_name: str, total_asset_usd: float) -> bool:
+    estimated_change_pct = row.get("estimated_change_pct", 0.0)
+    size = calculate_position_size(
+        row["signal_strength"],
+        method="percentage",
+        estimated_change_pct=estimated_change_pct,
+        total_asset_usd=total_asset_usd,
+    )
+    if size < 1.0:
+        print(f"  Skipped {symbol}: size too small (${size:.2f})")
+        return False
+
+    client.table("paper_trades").insert({
+        "symbol": symbol,
+        "side": side,
+        "entry_price": current_price,
+        "size": round(size, 2),
+        "entry_time": now_ms,
+        "model_name": model_name,
+        "prediction_at_entry": round(float(row["probability_up"]), 4),
+        "status": "open",
+    }).execute()
+
+    print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
+    return True
+
+
+def execute_reconciliation(client, plan: list[dict], prices: dict, now_ms: int,
+                           model_name: str, total_asset_usd: float) -> dict:
+    """Execute a plan from plan_reconciliation. Closes run before opens so a
+    REVERSE only opens after its close update succeeds."""
+    stats = {"kept": 0, "closed": 0, "opened": 0, "reversed": 0, "errors": 0}
+
+    # Phase 1: closes (CLOSE + the close leg of REVERSE).
+    for item in plan:
+        if item["action"] in (CLOSE, REVERSE):
+            item["_closed"] = _close_trade(client, item["trade"], prices[item["symbol"]], now_ms)
+            if item["action"] == CLOSE and item["_closed"]:
+                stats["closed"] += 1
+
+    # Phase 2: opens (OPEN + the open leg of REVERSE, only if the close succeeded).
+    for item in plan:
+        action = item["action"]
+        if action == OPEN:
+            if _open_position(client, item["symbol"], item["side"], item["row"],
+                              prices[item["symbol"]], now_ms, model_name, total_asset_usd):
+                stats["opened"] += 1
+        elif action == REVERSE and item.get("_closed"):
+            if _open_position(client, item["symbol"], item["side"], item["row"],
+                              prices[item["symbol"]], now_ms, model_name, total_asset_usd):
+                stats["reversed"] += 1
+        elif action == KEEP:
+            stats["kept"] += 1
+        elif action == ERROR:
+            stats["errors"] += 1
+            print(f"  ERROR {item['symbol']}: {item.get('reason')}")
+
+    return stats
 
 
 def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dict[str, float],
@@ -242,11 +267,11 @@ def main():
     exchange = create_exchange()
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    print("\n[1/6] Fetching live prices...")
+    print("\n[1/5] Fetching live prices...")
     prices = fetch_live_prices(exchange, SYMBOLS)
     print(f"  Got prices for {len(prices)}/{len(SYMBOLS)} symbols")
 
-    print("\n[2/6] Fetching latest predictions...")
+    print("\n[2/5] Fetching latest predictions...")
     predictions = fetch_latest_predictions(client, SYMBOLS)
     if predictions.empty:
         print("  No predictions found. Run trainer first.")
@@ -255,7 +280,7 @@ def main():
     model_name = predictions["model_name"].iloc[0] if "model_name" in predictions else "unknown"
     print(f"  Using model: {model_name}")
 
-    print("\n[3/6] Generating signals...")
+    print("\n[3/5] Generating signals...")
     signals = generate_signals(predictions)
     active_signals = signals[signals["signal"] != 0]
     print(f"  Active signals: {len(active_signals)}")
@@ -265,20 +290,20 @@ def main():
             est = s.get("estimated_change_pct", 0.0)
             print(f"    {s['symbol']}: {side} (P(up)={s['probability_up']:.2f}, est_change={est:.4f}, strength={s['signal_strength']:.2f})")
 
-    print("\n[4/6] Closing open positions...")
+    print("\n[4/5] Reconciling positions...")
     open_trades = fetch_open_trades(client)
-    print(f"  Open positions: {len(open_trades)}")
-    close_open_positions(client, open_trades, prices, now_ms)
-
-    print("\n[5/6] Opening new positions...")
-    open_trades_after = fetch_open_trades(client)
     trade_history = fetch_trade_history(client)
     total_asset_usd = INITIAL_CASH
     if not trade_history.empty and "actual_pnl_usd" in trade_history.columns:
         total_asset_usd += trade_history["actual_pnl_usd"].sum()
-    open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd)
 
-    print("\n[6/6] Updating portfolio...")
+    # Reconcile against the FULL signals frame so signal==0 can flatten.
+    plan = plan_reconciliation(signals, open_trades, prices)
+    stats = execute_reconciliation(client, plan, prices, now_ms, model_name, total_asset_usd)
+    print(f"  kept={stats['kept']} closed={stats['closed']} opened={stats['opened']} "
+          f"reversed={stats['reversed']} errors={stats['errors']}")
+
+    print("\n[5/5] Updating portfolio...")
     open_trades_final = fetch_open_trades(client)
     portfolio = update_portfolio(client, INITIAL_CASH, open_trades_final, prices, trade_history, now_ms)
     print(f"  Total Asset: ${portfolio['total_asset_usd']:.2f}")
