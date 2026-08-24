@@ -13,12 +13,16 @@ from src.strategy.signals import generate_signals
 from src.strategy.sizing import calculate_position_size
 from src.strategy.economics import (
     is_tradeable, expected_value, breakeven_accuracy, round_trip_cost_pct,
+    TAKER_FEE, SLIPPAGE_BPS,
 )
 from src.utils.metrics import sharpe_ratio, win_rate, trade_returns, annualization_factor
 
 INITIAL_CASH = 10000.0
-TAKER_FEE = 0.001
-SLIPPAGE_BPS = 5
+
+# TAKER_FEE / SLIPPAGE_BPS are imported from src.strategy.economics so the cost
+# the gate reasons about and the cost actually charged on a close cannot drift
+# apart. Duplicating them here once let the gate allow trades at a price the
+# engine did not charge.
 
 # A prediction older than this is not tradeable. Without this guard the engine
 # happily replayed one frozen prediction set for a full day, paying the
@@ -137,13 +141,12 @@ def estimate_expected_moves(exchange, symbols: list[str],
 
 
 def round_trip_cost(size: float) -> float:
-    """Fee + slippage for a full round trip (entry leg and exit leg).
+    """Fee + slippage in dollars for a full round trip (entry and exit legs).
 
     The old model charged a single leg, understating the real cost of the
-    hourly churn by half.
+    hourly churn by half. Uses the same rate as the EV gate.
     """
-    per_leg = size * TAKER_FEE + size * (SLIPPAGE_BPS / 10000)
-    return 2 * per_leg
+    return size * round_trip_cost_pct()
 
 
 def is_prediction_fresh(prediction_ts_ms: int, now_ms: int, max_age_hours: int = MAX_PREDICTION_AGE_HOURS) -> bool:

@@ -73,3 +73,14 @@ def test_longer_horizon_lowers_the_bar():
     daily = ec.breakeven_accuracy(0.002203 * (24 ** 0.5))
     assert daily < hourly
     assert daily < 1.0
+
+
+def test_engine_and_gate_share_one_cost_model():
+    """A divergence would let the gate allow trades at a cost never charged."""
+    from src.paper_trading import engine
+
+    assert engine.TAKER_FEE is ec.TAKER_FEE
+    assert engine.SLIPPAGE_BPS is ec.SLIPPAGE_BPS
+    # Dollar cost on a position must equal the fractional cost the gate uses.
+    assert engine.round_trip_cost(100.0) == pytest.approx(100.0 * ec.round_trip_cost_pct())
+    assert engine.round_trip_cost(250.0) == pytest.approx(250.0 * ec.round_trip_cost_pct())
