@@ -157,8 +157,20 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     features["vol_20"] = close.pct_change().rolling(20).std()
     features["skew_20"] = close.pct_change().rolling(20).skew()
 
-    features["target_1h"] = (features["log_return_1h"].shift(-1) > 0).astype(int)
-    features["target_4h"] = (features["log_return_4h"].shift(-4) > 0).astype(int)
+    # Bars with exactly zero return carry no direction. On thin, tick-quantized
+    # pairs they are common -- 29.6% of TRX/USDT hourly bars -- and labelling
+    # them "down" skews the class balance to 0.36 up, so always predicting
+    # "down" scores 64% and looks like skill. Leave them unlabelled (NaN) so
+    # training drops them instead.
+    next_ret_1h = features["log_return_1h"].shift(-1)
+    features["target_1h"] = np.where(
+        next_ret_1h > 0, 1.0, np.where(next_ret_1h < 0, 0.0, np.nan)
+    )
+
+    next_ret_4h = features["log_return_4h"].shift(-4)
+    features["target_4h"] = np.where(
+        next_ret_4h > 0, 1.0, np.where(next_ret_4h < 0, 0.0, np.nan)
+    )
 
     features = features.replace([np.inf, -np.inf], np.nan)
     return features

@@ -165,3 +165,37 @@ def test_fetch_features_returns_chronological_order():
 
 def test_fetch_features_handles_empty_table():
     assert trainer.fetch_features(PagingClient(0), "BTC/USDT").empty
+
+
+# --- honest skill metrics --------------------------------------------------
+
+def test_trx_style_imbalance_is_exposed_not_rewarded():
+    """TRX scored 0.6502 accuracy purely by always predicting the majority class."""
+    y_true = [0] * 641 + [1] * 359          # up-rate 0.359, as measured
+    preds = [0] * 1000                       # always "down"
+    sk = trainer.skill_metrics({"oos_preds": preds, "oos_y_true": y_true})
+
+    assert sk["majority_baseline"] == pytest.approx(0.641)
+    assert sk["edge_over_baseline"] == pytest.approx(0.0)
+    # Balanced accuracy sees straight through it.
+    assert sk["balanced_accuracy"] == pytest.approx(0.5)
+
+
+def test_real_edge_is_reported_as_positive():
+    y_true = [0, 1] * 500
+    preds = [y if i % 10 else 1 - y for i, y in enumerate(y_true)]
+    sk = trainer.skill_metrics({"oos_preds": preds, "oos_y_true": y_true})
+    assert sk["edge_over_baseline"] > 0.3
+    assert sk["balanced_accuracy"] > 0.8
+
+
+def test_skill_metrics_on_empty_input():
+    assert trainer.skill_metrics({}) == {}
+
+
+def test_promotion_gate_uses_edge_not_sharpe():
+    """Gating on sharpe_ratio promoted models on TRX's imbalance artifact."""
+    import inspect
+    src = inspect.getsource(trainer.check_auto_upgrade)
+    assert "edge_over_baseline" in src
+    assert "sharpe_ratio\"] > 1" not in src

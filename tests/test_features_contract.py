@@ -81,9 +81,28 @@ def test_target_uses_next_bar_return_not_current():
     df = _synthetic_candles(100)
     feats = engineer_features(df)
     log_ret = np.log(df["close"] / df["close"].shift(1))
-    expected = (log_ret.shift(-1) > 0).astype(int)
-    pd.testing.assert_series_equal(
-        feats["target_1h"].reset_index(drop=True),
-        expected.reset_index(drop=True),
-        check_names=False,
-    )
+    nxt = log_ret.shift(-1)
+
+    up = nxt > 0
+    assert (feats["target_1h"][up] == 1).all()
+    assert (feats["target_1h"][nxt < 0] == 0).all()
+
+
+def test_flat_bars_are_unlabelled_not_scored_as_down():
+    """29.6% of TRX bars are exactly flat; labelling them "down" faked a 64% model."""
+    n = 120
+    close = np.full(n, 100.0)
+    close[::2] = 100.0          # long flat stretches
+    close[60:] = 101.0          # one real move, then flat again
+    df = pd.DataFrame({
+        "symbol": "TRX/USDT",
+        "timestamp": np.arange(n) * 3_600_000,
+        "open": close, "high": close * 1.001, "low": close * 0.999,
+        "close": close, "volume": np.full(n, 10.0),
+    })
+    feats = engineer_features(df)
+
+    nxt = np.log(pd.Series(close) / pd.Series(close).shift(1)).shift(-1)
+    flat = nxt == 0
+    assert flat.sum() > 0, "fixture must contain flat bars"
+    assert feats["target_1h"][flat].isna().all(), "flat bars must be unlabelled"

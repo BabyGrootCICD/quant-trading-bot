@@ -12,10 +12,15 @@ from src.models.features import FEATURE_COLS
 from src.models.logistic import LogisticModel
 from src.models.xgboost_model import XGBoostModel, HAS_XGBOOST
 from src.utils.metrics import sharpe_ratio, expected_value, win_rate
+from src.strategy.economics import breakeven_accuracy
 
 # Cap on how much history each training run pulls. Two years of hourly bars
 # is ~17.5k rows; this keeps the whole window without unbounded growth.
 MAX_TRAINING_ROWS = 20000
+
+# Minimum accuracy edge over the majority-class baseline before a model is
+# considered good enough to promote. Every current model sits under 2pp.
+MIN_PROMOTION_EDGE = 0.02
 
 LOGISTIC_MODEL_NAME = LogisticModel.name
 XGBOOST_MODEL_NAME = XGBoostModel.name
@@ -63,6 +68,41 @@ def fetch_features(client, symbol: str, max_rows: int = MAX_TRAINING_ROWS) -> pd
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def skill_metrics(metrics: dict) -> dict:
+    """Accuracy relative to the majority-class baseline.
+
+    Raw accuracy is meaningless on an imbalanced label. TRX/USDT scored 0.6502
+    and a Sharpe of 29.47, which reads as a strong model -- but its up-rate is
+    0.3587, so always answering "down" scores 0.6413. The real edge was
+    +0.89pp, in line with every other symbol. `check_auto_upgrade()` gates on
+    Sharpe, so that artifact drove model promotion too.
+    """
+    y_true = metrics.get("oos_y_true") or []
+    preds = metrics.get("oos_preds") or []
+    if not y_true or not preds:
+        return {}
+
+    n = len(y_true)
+    up_rate = sum(1 for y in y_true if y == 1) / n
+    baseline = max(up_rate, 1 - up_rate)
+    accuracy = sum(1 for p, y in zip(preds, y_true) if p == y) / n
+
+    # Balanced accuracy: mean of per-class recall, immune to class skew.
+    recalls = []
+    for cls in (0, 1):
+        actual = [i for i, y in enumerate(y_true) if y == cls]
+        if actual:
+            recalls.append(sum(1 for i in actual if preds[i] == cls) / len(actual))
+    balanced = sum(recalls) / len(recalls) if recalls else 0.0
+
+    return {
+        "up_rate": round(up_rate, 4),
+        "majority_baseline": round(baseline, 4),
+        "balanced_accuracy": round(balanced, 4),
+        "edge_over_baseline": round(accuracy - baseline, 4),
+    }
 
 
 def out_of_sample_pnl(metrics: dict) -> list[float]:
@@ -133,6 +173,8 @@ def train_walk_forward(client, symbol: str, model, n_splits: int = 5) -> dict:
     metrics["sharpe"] = round(sharpe_ratio(all_pnl), 4) if all_pnl else 0.0
     metrics["win_rate"] = round(win_rate(all_pnl), 4) if all_pnl else 0.0
 
+    metrics.update(skill_metrics(metrics))
+
     # Bulky and already summarised; do not carry into the metrics row.
     metrics.pop("oos_preds", None)
     metrics.pop("oos_y_true", None)
@@ -167,6 +209,8 @@ def train_and_evaluate(client, symbol: str, model) -> dict:
     metrics["ev"] = round(expected_value(all_pnl), 4) if all_pnl else 0.0
     metrics["sharpe"] = round(sharpe_ratio(all_pnl), 4) if all_pnl else 0.0
     metrics["win_rate"] = round(win_rate(all_pnl), 4) if all_pnl else 0.0
+
+    metrics.update(skill_metrics(metrics))
 
     # Bulky and already summarised; do not carry into the metrics row.
     metrics.pop("oos_preds", None)
@@ -215,8 +259,12 @@ def check_auto_upgrade(client) -> str:
 
     if current_model == LOGISTIC_MODEL_NAME:
         logistic_recent = recent[recent["model_name"] == LOGISTIC_MODEL_NAME]
-        if len(logistic_recent) >= 7 and (logistic_recent["sharpe_ratio"] > 1).all():
-            return XGBOOST_MODEL_NAME
+        # Gate on demonstrated edge over the majority-class baseline. Gating on
+        # sharpe_ratio promoted models on TRX's class-imbalance artifact.
+        if "edge_over_baseline" in logistic_recent.columns:
+            edge = pd.to_numeric(logistic_recent["edge_over_baseline"], errors="coerce")
+            if len(logistic_recent) >= 7 and (edge > MIN_PROMOTION_EDGE).all():
+                return XGBOOST_MODEL_NAME
 
     return current_model
 
@@ -249,7 +297,10 @@ def main():
             log_model_metrics(client, metrics)
 
             if "error" not in metrics:
-                print(f"  Accuracy: {metrics.get('test_accuracy', 'N/A')}")
+                print(f"  Accuracy: {metrics.get('test_accuracy', 'N/A')} "
+                      f"(baseline {metrics.get('majority_baseline', 'N/A')}, "
+                      f"edge {metrics.get('edge_over_baseline', 'N/A')})")
+                print(f"  Balanced accuracy: {metrics.get('balanced_accuracy', 'N/A')}")
                 print(f"  Sharpe: {metrics.get('sharpe', 'N/A')}")
                 print(f"  Win rate: {metrics.get('win_rate', 'N/A')}")
                 print(f"  Signals: {metrics.get('total_signals', 0)}")

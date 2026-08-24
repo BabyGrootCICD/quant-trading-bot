@@ -119,14 +119,68 @@ def test_already_held_symbol_is_not_reopened():
     assert inserts == [], "re-entering an identical position just pays the spread again"
 
 
-def test_new_symbol_is_opened():
+# A 0.8-strength signal has a 0.6 edge multiplier, so it needs E|move| > 0.5%
+# to clear the 0.30% round trip.
+TRADEABLE_MOVES = {"BTC/USDT": 0.01, "ETH/USDT": 0.01}
+REAL_MOVES = {"BTC/USDT": 0.0022, "ETH/USDT": 0.0031}  # measured hourly moves
+
+
+def test_new_symbol_is_opened_when_edge_clears_cost():
     client = FakeClient()
     engine.open_new_positions(client, _signals(btc=1, eth=0), PRICES, NOW, "logistic_v2",
-                              10000.0, held={})
+                              10000.0, held={}, expected_moves=TRADEABLE_MOVES)
     inserts = [c for c in client.calls if c[1] == "insert"]
     assert len(inserts) == 1
     assert inserts[0][2]["symbol"] == "BTC/USDT"
     assert inserts[0][2]["side"] == "long"
+
+
+def test_real_hourly_volatility_blocks_the_trade():
+    """The core finding: at 1h, BTC's 0.22% move cannot pay a 0.30% round trip."""
+    client = FakeClient()
+    engine.open_new_positions(client, _signals(btc=1, eth=0), PRICES, NOW, "logistic_v2",
+                              10000.0, held={}, expected_moves=REAL_MOVES)
+    assert [c for c in client.calls if c[1] == "insert"] == []
+
+
+def test_missing_volatility_estimate_blocks_the_trade():
+    client = FakeClient()
+    engine.open_new_positions(client, _signals(btc=1, eth=0), PRICES, NOW, "logistic_v2",
+                              10000.0, held={}, expected_moves={})
+    assert [c for c in client.calls if c[1] == "insert"] == []
+
+
+def test_position_size_uses_real_expected_move_not_the_fabricated_map():
+    """estimated_change_pct was (p-0.5)*2*0.02 -- unrelated to real volatility."""
+    client = FakeClient()
+    engine.open_new_positions(client, _signals(btc=-1, eth=0), PRICES, NOW, "logistic_v2",
+                              10000.0, held={}, expected_moves=TRADEABLE_MOVES)
+    inserts = [c for c in client.calls if c[1] == "insert"]
+    assert len(inserts) == 1
+    assert inserts[0][2]["side"] == "short"
+
+
+# --- stats epoch -----------------------------------------------------------
+
+def test_legacy_broken_era_trades_are_excluded_from_stats():
+    epoch = 1_787_531_100_000
+    hist = pd.DataFrame({
+        "pnl": [-0.15] * 3 + [1.0] * 2,
+        "size": [100.0] * 5,
+        "entry_time": [epoch - 3_600_000, epoch - 7_200_000, epoch - 1, epoch, epoch + 3_600_000],
+    })
+    kept = engine.filter_to_stats_epoch(hist, epoch_ms=epoch)
+    assert len(kept) == 2
+    assert (kept["pnl"] == 1.0).all()
+
+
+def test_stats_epoch_passes_through_when_column_absent():
+    hist = pd.DataFrame({"pnl": [1.0], "size": [100.0]})
+    assert len(engine.filter_to_stats_epoch(hist)) == 1
+
+
+def test_stats_epoch_handles_empty_history():
+    assert engine.filter_to_stats_epoch(pd.DataFrame()).empty
 
 
 # --- honest cost accounting -----------------------------------------------

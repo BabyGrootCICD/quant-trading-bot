@@ -7,10 +7,13 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from config.settings import SYMBOLS, EXCHANGE_ID
+from config.settings import SYMBOLS, EXCHANGE_ID, STATS_EPOCH_MS
 from src.data.supabase_client import get_client
 from src.strategy.signals import generate_signals
 from src.strategy.sizing import calculate_position_size
+from src.strategy.economics import (
+    is_tradeable, expected_value, breakeven_accuracy, round_trip_cost_pct,
+)
 from src.utils.metrics import sharpe_ratio, win_rate, trade_returns, annualization_factor
 
 INITIAL_CASH = 10000.0
@@ -25,6 +28,15 @@ MAX_PREDICTION_AGE_HOURS = 2
 # Number of closed trades pulled for portfolio stats. The old 500 cap silently
 # truncated total_pnl and total_trades once the bot passed 500 trades.
 TRADE_HISTORY_LIMIT = 5000
+
+# How much the expected edge must exceed the round-trip cost before a trade is
+# worth taking. At a 1h horizon this blocks nearly everything -- see
+# .claude/STRATEGY_PLAN.md Finding 1. Not trading beats paying 0.30% for a
+# half-point edge.
+MIN_EDGE_MARGIN = float(os.getenv("MIN_EDGE_MARGIN", "1.0"))
+
+# Bars of recent history used to estimate each symbol's typical move.
+VOLATILITY_LOOKBACK = 168
 
 
 def create_exchange():
@@ -97,6 +109,31 @@ def fetch_portfolio_history(client, limit: int = 168) -> pd.DataFrame:
         .execute()
     )
     return pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
+
+
+def estimate_expected_moves(exchange, symbols: list[str],
+                            lookback: int = VOLATILITY_LOOKBACK) -> dict[str, float]:
+    """Mean absolute hourly log return per symbol, from recent live candles.
+
+    This replaces `estimated_change_pct = (probability_up - 0.5) * 2 * 0.02`,
+    a fabricated linear map with a hardcoded 2% ceiling that had nothing to do
+    with any symbol's actual volatility. The EV gate needs a real number.
+    """
+    moves = {}
+    for symbol in symbols:
+        try:
+            candles = exchange.fetch_ohlcv(symbol, "1h", limit=lookback + 1)
+            closes = np.array([c[4] for c in candles], dtype=float)
+            if len(closes) < 2:
+                continue
+            rets = np.diff(np.log(closes))
+            rets = rets[np.isfinite(rets)]
+            if len(rets) == 0:
+                continue
+            moves[symbol] = float(np.mean(np.abs(rets)))
+        except Exception as e:
+            print(f"  Failed to estimate volatility for {symbol}: {e}")
+    return moves
 
 
 def round_trip_cost(size: float) -> float:
@@ -190,8 +227,10 @@ def close_open_positions(client, open_trades: pd.DataFrame, prices: dict[str, fl
 
 
 def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], now_ms: int, model_name: str,
-                       total_asset_usd: float, held: dict[str, str] | None = None):
+                       total_asset_usd: float, held: dict[str, str] | None = None,
+                       expected_moves: dict[str, float] | None = None):
     held = held or {}
+    expected_moves = expected_moves or {}
     if signals.empty:
         return
 
@@ -204,6 +243,21 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
         if signal == 0:
             continue
 
+        # Does this signal clear its own transaction cost?
+        strength = float(row["signal_strength"])
+        exp_move = expected_moves.get(symbol)
+        if exp_move is None:
+            print(f"  Skipped {symbol}: no volatility estimate")
+            continue
+
+        if not is_tradeable(strength, exp_move, margin=MIN_EDGE_MARGIN):
+            ev = expected_value(strength, exp_move)
+            need = breakeven_accuracy(exp_move)
+            print(f"  Skipped {symbol}: EV {ev*100:+.3f}% "
+                  f"(strength {strength:.2f}, E|move| {exp_move*100:.3f}%, "
+                  f"needs {need*100:.1f}% accuracy)")
+            continue
+
         side = "long" if signal == 1 else "short"
         if held.get(symbol) == side:
             # Already positioned this way; re-entering would just pay the
@@ -212,9 +266,10 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
             continue
 
         current_price = prices[symbol]
-        estimated_change_pct = row.get("estimated_change_pct", 0.0)
+        # Signed real expected move, not the fabricated (p-0.5)*2*0.02 map.
+        estimated_change_pct = exp_move if side == "long" else -exp_move
         size = calculate_position_size(
-            row["signal_strength"],
+            strength,
             method="percentage",
             estimated_change_pct=estimated_change_pct,
             total_asset_usd=total_asset_usd,
@@ -236,6 +291,20 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
         }).execute()
 
         print(f"  Opened {side} {symbol} @ {current_price:.2f} size=${size:.2f} est_change={estimated_change_pct:.4f}")
+
+
+def filter_to_stats_epoch(trade_history: pd.DataFrame, epoch_ms: int = STATS_EPOCH_MS) -> pd.DataFrame:
+    """Drop trades entered before the pipeline was fixed.
+
+    The first 75 closed trades were made while the engine replayed a frozen
+    prediction set every hour. Including them keeps sharpe_ratio pinned near
+    -45 and win_rate near 0.35 no matter how the current system performs,
+    because the Sharpe window is only 168 trades deep.
+    """
+    if trade_history.empty or "entry_time" not in trade_history.columns:
+        return trade_history
+    times = pd.to_numeric(trade_history["entry_time"], errors="coerce")
+    return trade_history[times >= epoch_ms]
 
 
 def compute_sharpe(trade_history: pd.DataFrame, window: int = 168) -> float:
@@ -305,17 +374,20 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     equity = cash_balance + positions_value
     total_asset_usd = equity
 
+    # Statistics describe the current system, not the frozen-signal era.
+    stats_history = filter_to_stats_epoch(trade_history)
+
     closed_pnl = []
     closed_sizes = []
-    if not trade_history.empty and "pnl" in trade_history.columns:
-        hist = trade_history.dropna(subset=["pnl"])
+    if not stats_history.empty and "pnl" in stats_history.columns:
+        hist = stats_history.dropna(subset=["pnl"])
         closed_pnl = hist["pnl"].tolist()
         closed_sizes = hist["size"].tolist() if "size" in hist.columns else []
 
     total_pnl = sum(closed_pnl) if closed_pnl else 0.0
     wr = win_rate(closed_pnl)
     total_trades = len(closed_pnl)
-    sr = compute_sharpe(trade_history)
+    sr = compute_sharpe(stats_history)
 
     client.table("portfolio").insert({
         "timestamp": now_ms,
@@ -344,6 +416,15 @@ def main():
     print("\n[1/6] Fetching live prices...")
     prices = fetch_live_prices(exchange, SYMBOLS)
     print(f"  Got prices for {len(prices)}/{len(SYMBOLS)} symbols")
+
+    print(f"  Round-trip cost: {round_trip_cost_pct()*100:.2f}% of position")
+
+    print("\n[1b/6] Estimating expected moves...")
+    expected_moves = estimate_expected_moves(exchange, SYMBOLS)
+    for sym, mv in sorted(expected_moves.items()):
+        need = breakeven_accuracy(mv)
+        note = "  UNREACHABLE" if need > 1 else ""
+        print(f"    {sym}: E|move|={mv*100:.3f}% -> needs {need*100:.1f}% accuracy{note}")
 
     print("\n[2/6] Fetching latest predictions...")
     predictions = fetch_latest_predictions(client, SYMBOLS)
@@ -399,7 +480,8 @@ def main():
     if active_signals.empty:
         print("  No fresh signals; not opening anything.")
     else:
-        open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd, held=held)
+        open_new_positions(client, active_signals, prices, now_ms, model_name, total_asset_usd,
+                           held=held, expected_moves=expected_moves)
 
     print("\n[6/6] Updating portfolio...")
     open_trades_final = fetch_open_trades(client)
