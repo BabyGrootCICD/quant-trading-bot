@@ -421,16 +421,24 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
         current_price = prices[c.symbol]
         forecast = predicted_price(current_price, c.probability_up, c.expected_abs_move)
 
-        client.table("paper_trades").insert({
-            "symbol": c.symbol,
-            "side": c.side,
-            "entry_price": current_price,
-            "size": round(size, 2),
-            "entry_time": now_ms,
-            "model_name": model_name,
-            "prediction_at_entry": round(c.probability_up, 4),
-            "status": "open",
-        }).execute()
+        try:
+            client.table("paper_trades").insert({
+                "symbol": c.symbol,
+                "side": c.side,
+                "entry_price": current_price,
+                "size": round(size, 2),
+                "entry_time": now_ms,
+                "model_name": model_name,
+                "prediction_at_entry": round(c.probability_up, 4),
+                "status": "open",
+            }).execute()
+        except Exception as e:
+            # A concurrent run may have already opened this symbol. The partial
+            # unique index paper_trades_one_open_per_symbol (migration 005)
+            # rejects the duplicate; skip rather than crash the run that lost
+            # the race.
+            print(f"  Skipped {c.symbol}: open insert rejected, likely concurrent run ({e})")
+            continue
 
         opened.append(c.symbol)
         print(f"  Opened {c.side} {c.symbol} @ {current_price:.2f} size=${size:.2f} "
