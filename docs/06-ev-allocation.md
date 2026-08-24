@@ -323,3 +323,107 @@ both tables to `*_archive`, verifies the counts, clears the originals, and
 adds `portfolio.scored_trades`. The 77 broken-era trades that docs 01-04 are
 written against are preserved, and the next cycle recomputes a clean
 $10,000.
+
+
+---
+
+# Addendum 2: the forecast horizon, and where exits belong
+
+## The question that started it: run the pipeline every 10 minutes?
+
+No, and the 8-minutes-of-runtime-versus-a-10-minute-gap margin is not the
+reason. Three things, in increasing order of importance.
+
+**The margin is thinner than it looks.** Over the last 20 scheduled runs:
+median 7.1 min, **max 12.9 min** — already past a 10-minute gap. And
+`concurrency: cancel-in-progress: false` queues exactly one pending run;
+further ones are cancelled, so overlap silently *drops* cycles rather than
+delaying them.
+
+**GitHub does not honour the interval anyway.** Against a `0 * * * *` cron:
+
+```
+gap between scheduled runs:  min 47m   median 63m   max 136m
+```
+
+Deliveries landed at 14:48, 13:00, 11:34, 10:41, 09:54 — nowhere near `:00` —
+and the 136-minute gap is an hour skipped outright. A `*/10` cron buys
+delivery *attempts*, not deliveries.
+
+**The data is hourly.** 1h candles, a next-1h label. Six runs an hour
+re-derive one prediction from one closed bar. Worse, the newest candle the
+fetcher stores is the *forming* bar — checked live, 46% complete at run time —
+so features like `volume_ratio`, computed from partial volume, drift further
+off the training distribution the earlier in the bar you run.
+
+## The real defect it surfaced
+
+The EV gate priced every candidate at its **full-bar** expected move. But the
+forecast is for the next bar, and the pipeline does not enter at the top of
+it. Volatility scales with √t, so a part-bar holding period collects only
+part of the move — while the round trip is paid in full regardless.
+
+A setup clearing the gate by +0.100% at the open:
+
+| minutes into bar | collectable E&#124;move&#124; | realised EV |
+|---|---|---|
+| 0 | 2.000% | **+0.100%** |
+| 20 | 1.633% | +0.027% |
+| 30 | 1.414% | −0.017% |
+| 50 | 0.816% | −0.137% |
+
+With runs landing at 14:48 and 11:34, the gate was routinely approving trades
+whose EV it could not collect. This was live at hourly cadence; a 10-minute
+schedule would only have multiplied it.
+
+**Fix** — `horizon_fraction()` and `collectable_move()` in
+`src/strategy/economics.py`. `build_candidates` discounts the forecast by
+`√(fraction of bar remaining)` before both the gate and the allocator, and
+`MIN_HORIZON_FRACTION` (default 0.25) declines outright in the last quarter,
+where the remaining-move estimate is microstructure rather than model.
+
+### One counter-intuitive property, pinned in tests
+
+Shortening the horizon *raises* the raw Kelly fraction. Edge falls as √f while
+variance falls as f, so edge/variance scales as 1/√f — a shorter bet is less
+variable, and Kelly asks for more of it:
+
+| minutes into bar | EV | raw Kelly | after the 10% cap |
+|---|---|---|---|
+| 0 | 0.700% | 2.785 | 0.100 |
+| 30 | 0.407% | 3.240 | 0.100 |
+| 40 | 0.277% | 3.311 | 0.100 |
+
+So the horizon discount must **not** be relied on to shrink positions. The
+protection is the gate refusing the trade and the per-symbol cap bounding it —
+never the sizer trimming it. `test_shortening_the_horizon_raises_raw_kelly_not_lowers_it`
+exists so a future "fix" does not quietly remove the cap on the assumption
+that sizing handles it.
+
+## Exits moved to their own workflow
+
+A stop is about where price is *now*, which changes continuously — unlike the
+model, which cannot learn anything new until a bar closes. Yet a stop was only
+consulted when the full pipeline ran, i.e. every 47 to 136 minutes.
+
+`src/paper_trading/risk_monitor.py` + `.github/workflows/risk_monitor.yml` run
+every 15 minutes and evaluate stops, targets and holding limits only. The
+narrowness is the safety property, and it is enforced by tests rather than by
+convention:
+
+* it never inserts a trade (asserted via AST, because a grep for `.insert(`
+  matches the `sys.path.insert` import shim and passes for the wrong reason);
+* it never imports `generate_signals`, `build_candidates` or
+  `fetch_latest_predictions`, so it cannot act on a stale prediction or
+  contradict the hourly cycle's direction;
+* it shares `risk_exit_reason`, `close_trade` and `update_portfolio` with the
+  engine by identity, so two copies of a stop rule cannot drift apart.
+
+It installs four packages rather than the full requirements file, which keeps
+it near a minute, and writes a `portfolio` row only when something closed.
+
+**One bug caught while building it:** the first version read `trade_history`
+*after* writing the closes, then passed it through `augment_history()` — which
+adds those same closes again. A stop-out would have been booked at twice its
+loss. The history is now read before any write, matching the hourly cycle, and
+`test_the_history_is_read_before_the_closes_are_written` pins the ordering.

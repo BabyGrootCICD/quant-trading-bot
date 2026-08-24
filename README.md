@@ -4,11 +4,18 @@ Hourly crypto trading bot using ML predictions on BinanceUS, scheduled via GitHu
 
 ## Strategy
 
-- **Model**: Logistic Regression → auto-upgrade to XGBoost when Sharpe > 1 for 7 days
+- **Model**: Logistic → Neural (MLP) → XGBoost, promoted on demonstrated edge over the
+  majority-class baseline, never on Sharpe. Probabilities are calibrated before use.
 - **Assets**: BTC, ETH, BNB, SOL, XRP, ADA, DOGE, TRX (all /USDT)
 - **Timeframe**: 1H hourly candles
-- **Logic**: Predict P(up) for next hour → BUY if P(up) > 0.55, SELL if P(up) < 0.45
-- **Sizing**: Percentage-based — position size scales with estimated change magnitude
+- **Direction**: `sign(P(up) − 0.5)`. There is no probability threshold — a fixed one
+  judges `P(up)` alone and cannot see the forecast move size.
+- **Entry**: expected value only. `EV = (2p − 1) × E|move| × √(bar remaining) − cost`,
+  where `E|move|` comes from a conditional magnitude model, not a symbol average.
+  A trade must clear its own round trip.
+- **Sizing**: fractional Kelly on that EV and its variance, capped per symbol and by
+  gross exposure, allocated across all candidates from one shared budget.
+- **Exits**: stop, target, max holding period, then signal — risk first.
 
 ## Dashboard Metrics
 
@@ -24,10 +31,20 @@ Hourly crypto trading bot using ML predictions on BinanceUS, scheduled via GitHu
 
 | Time | Workflow | Action |
 |------|----------|--------|
-| Hourly (:00) | `hourly_pipeline.yml` | Fetch candles → compute features → train models → paper trade (single run) |
+| Hourly (`0 * * * *`) | `hourly_pipeline.yml` | Fetch candles → compute features → train models → reconcile positions |
+| Every 15 min | `risk_monitor.yml` | Stops, targets and holding limits only. Never opens a position. |
 | Sun 6AM (UTC) | `quantum_optimize.yml` | Portfolio opt, risk analysis, kernel comparison |
 
-> Fetch, feature computation, training, and paper trading all run together in the hourly pipeline; there is no separate weekly training workflow. Whether training *should* run hourly vs weekly is tracked in #2.
+> **The hourly cron is a request, not a guarantee.** Measured over 20 scheduled
+> runs, gaps between deliveries ranged 47–136 minutes against a `0 * * * *`
+> cron — GitHub deprioritises scheduled workflows under load and skips hours
+> outright. That is why exits live in their own lightweight workflow: a stop
+> should not wait on a training run that may be two hours late.
+>
+> Running the *full* pipeline more often would not help. The data is hourly, so
+> six runs per hour re-derive one prediction from one closed bar — and entering
+> late in a bar collects only part of the forecast move while paying the whole
+> round trip. The engine now prices that in; see `horizon_fraction()`.
 
 ## Quick Start
 

@@ -15,6 +15,42 @@ manually with:
 gh workflow run hourly_pipeline.yml --ref main
 ```
 
+## The risk monitor
+
+`.github/workflows/risk_monitor.yml` runs every 15 minutes and does one thing:
+mark open positions and close the ones that hit a stop, a target or the
+holding limit. It never opens a position, never reads a prediction, and never
+trains, so it cannot act on stale state or disagree with the hourly cycle
+about direction — `risk_exit_reason()` is the only rule it consults, imported
+from the engine rather than reimplemented.
+
+It installs four packages instead of the full requirements file, which is what
+keeps it near a minute against the pipeline's seven.
+
+```bash
+gh workflow run risk_monitor.yml --ref main
+python -m src.paper_trading.risk_monitor      # locally
+```
+
+Why it exists: against a `0 * * * *` cron, GitHub delivered the hourly
+pipeline with gaps of 47 to 136 minutes. A stop that is only consulted when
+the pipeline runs is a stop with an unbounded delay.
+
+It writes a `portfolio` row only when something actually closed — otherwise a
+15-minute cadence would bury the hourly cycle's rows under identical ones.
+
+## Why the pipeline is not run more often
+
+The data is hourly: 1h candles, a next-1h label. Six runs an hour re-derive
+one prediction from one closed bar, and the newest candle in the table is the
+*forming* bar, so running earlier in the hour feeds the model a feature vector
+(volume ratio especially) further off the distribution it was trained on.
+
+Separately, a prediction is only collectable over what is left of the bar it
+was made for. `horizon_fraction()` scales the forecast by that remainder and
+`MIN_HORIZON_FRACTION` (default 0.25) refuses entries in the last quarter
+outright.
+
 ## Migrations are manual
 
 This repo has no service-role database connection — only the anon REST key —

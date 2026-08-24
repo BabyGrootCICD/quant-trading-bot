@@ -15,7 +15,8 @@ from src.strategy.signals import generate_signals
 from src.strategy.allocation import Candidate, allocate
 from src.strategy.economics import (
     is_tradeable, expected_value, breakeven_accuracy, round_trip_cost_pct,
-    expected_return, predicted_price, TAKER_FEE, SLIPPAGE_BPS,
+    expected_return, predicted_price, horizon_fraction, collectable_move,
+    MIN_HORIZON_FRACTION, TAKER_FEE, SLIPPAGE_BPS,
 )
 from src.utils.metrics import (
     sharpe_ratio, win_rate, trade_returns, annualization_factor, MIN_SHARPE_TRADES,
@@ -632,17 +633,35 @@ def resolve_expected_move(row, expected_moves: dict[str, float] | None) -> float
 def build_candidates(signals: pd.DataFrame, prices: dict[str, float],
                      held: dict[str, str] | None = None,
                      expected_moves: dict[str, float] | None = None,
-                     margin: float = MIN_EDGE_MARGIN) -> list[Candidate]:
+                     margin: float = MIN_EDGE_MARGIN,
+                     now_ms: int | None = None,
+                     min_horizon: float = MIN_HORIZON_FRACTION) -> list[Candidate]:
     """Signals that survive the EV gate, priced in expected-return terms.
 
     Separating selection from sizing is the point: the gate decides *whether*
     a bet is worth making, the allocator decides *how much* of the book it
     gets, and neither can quietly override the other.
+
+    The forecast is discounted by how much of the bar is still ahead. A
+    prediction is made for the next bar, but the pipeline does not enter at the
+    top of it -- observed starts run 40-80% into the bar -- and the round trip
+    is paid in full regardless. Pricing a part-bar holding period at the full
+    move is what let the gate approve trades whose EV it could not collect:
+    a setup clearing by +0.100% at the top of the hour is worth -0.137% if
+    entered fifty minutes in.
     """
     held = held or {}
     candidates = []
 
     if signals is None or signals.empty:
+        return candidates
+
+    fraction = 1.0 if now_ms is None else horizon_fraction(now_ms)
+    if now_ms is not None and fraction < min_horizon:
+        mins_left = fraction * 60
+        print(f"  Opening nothing: only {mins_left:.0f} min of the forecast bar "
+              f"remain ({fraction:.0%} < {min_horizon:.0%} minimum). The round "
+              "trip costs the same whenever it is paid; the move does not.")
         return candidates
 
     for _, row in signals.iterrows():
@@ -661,19 +680,29 @@ def build_candidates(signals: pd.DataFrame, prices: dict[str, float],
             continue
 
         strength = float(row["signal_strength"])
-        exp_move = resolve_expected_move(row, expected_moves)
-        if exp_move is None:
+        forecast_move = resolve_expected_move(row, expected_moves)
+        if forecast_move is None:
             print(f"  Skipped {symbol}: no expected-move forecast")
             continue
+
+        # What is actually still collectable, not what the whole bar was worth.
+        exp_move = collectable_move(forecast_move, fraction)
 
         if not is_tradeable(strength, exp_move, margin=margin):
             ev = expected_value(strength, exp_move)
             need = breakeven_accuracy(exp_move)
+            horizon_note = ""
+            if fraction < 1.0:
+                horizon_note = (f", {forecast_move*100:.3f}% over a full bar but "
+                                f"{fraction:.0%} of it left")
             print(f"  Skipped {symbol}: EV {ev*100:+.3f}% "
-                  f"(strength {strength:.2f}, E|move| {exp_move*100:.3f}%, "
+                  f"(strength {strength:.2f}, E|move| {exp_move*100:.3f}%{horizon_note}, "
                   f"needs {need*100:.1f}% accuracy)")
             continue
 
+        # The discounted move is what the allocator sizes on too -- Kelly reads
+        # both the edge and the variance off it, so passing the undiscounted
+        # figure here would size a part-bar bet as though it were a full one.
         candidates.append(Candidate(
             symbol=symbol,
             side=side,
@@ -700,7 +729,8 @@ def open_new_positions(client, signals: pd.DataFrame, prices: dict[str, float], 
     scaled to fit the cash and gross-exposure limits, so the money goes where
     the edge per unit of risk is largest and stops when the budget is gone.
     """
-    candidates = build_candidates(signals, prices, held=held, expected_moves=expected_moves)
+    candidates = build_candidates(signals, prices, held=held,
+                                  expected_moves=expected_moves, now_ms=now_ms)
     if not candidates:
         return []
 

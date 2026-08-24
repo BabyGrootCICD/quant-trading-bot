@@ -1,0 +1,50 @@
+name: Risk Monitor (exits only)
+
+on:
+  schedule:
+    # Every 15 minutes. Not 10: GitHub's scheduler is best-effort and the
+    # hourly pipeline's own cron already drifts 47-136 minutes against a
+    # `0 * * * *`, so a tighter cron buys delivery attempts, not delivery.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# Separate group from the hourly pipeline on purpose. This job only ever
+# closes positions and never opens one, so it cannot race the pipeline into a
+# duplicate; serialising the two would just mean a risk check is skipped
+# whenever training happens to be running, which is exactly when a stop is
+# most likely to be overdue.
+concurrency:
+  group: risk-monitor
+  cancel-in-progress: false
+
+jobs:
+  risk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # Only what a risk pass touches: prices, the database, and dataframes.
+      # Skipping scikit-learn/xgboost/qiskit is what keeps this job at roughly
+      # a minute against the pipeline's seven.
+      - name: Install dependencies
+        run: pip install ccxt supabase python-dotenv numpy pandas
+
+      - name: Check stops, targets and holding limits
+        run: python -m src.paper_trading.risk_monitor
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EXCHANGE_ID: binanceus
+          # Must match the hourly pipeline, or the two disagree about when a
+          # position should have been closed.
+          STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}
+          TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}
+          MAX_HOLDING_HOURS: ${{ vars.MAX_HOLDING_HOURS }}
+          EXECUTION_MODE: ${{ vars.EXECUTION_MODE }}
+          TAKER_FEE: ${{ vars.TAKER_FEE }}
+          SLIPPAGE_BPS: ${{ vars.SLIPPAGE_BPS }}

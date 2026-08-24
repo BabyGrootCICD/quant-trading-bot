@@ -136,3 +136,37 @@ def move_volatility(expected_abs_move: float) -> float:
     estimate available from the magnitude head.
     """
     return max(float(expected_abs_move), 0.0) * math.sqrt(math.pi / 2)
+
+
+# A prediction is for the *next bar*, so its expected move is only collectable
+# over what remains of that bar. Below this fraction the entry is refused
+# outright rather than merely priced down -- at the tail end of a bar the
+# remaining-move estimate is dominated by microstructure, not by the model.
+MIN_HORIZON_FRACTION = env_float("MIN_HORIZON_FRACTION", 0.25)
+
+
+def horizon_fraction(now_ms: int, bar_ms: int = 3_600_000) -> float:
+    """Fraction of the current bar still ahead of us, in [0, 1].
+
+    The pipeline does not run at the top of the hour. GitHub's scheduler is
+    best-effort: against a `0 * * * *` cron, observed starts were 14:48, 13:00,
+    11:34, 10:41 -- routinely 40-80% of the way through the bar the prediction
+    was made for.
+    """
+    if bar_ms <= 0:
+        return 1.0
+    elapsed = int(now_ms) % bar_ms
+    return max(0.0, min(1.0, 1.0 - elapsed / bar_ms))
+
+
+def collectable_move(expected_abs_move: float, fraction: float) -> float:
+    """The part of a full-bar move still available over `fraction` of the bar.
+
+    Volatility scales with the square root of time, so half a bar left is not
+    half the move -- it is about 71% of it. Using the full forecast for a
+    partial holding period is what made the gate approve trades it could not
+    collect: costs are paid in full whatever the entry time, but the move is
+    not.
+    """
+    fraction = max(0.0, min(1.0, float(fraction)))
+    return float(expected_abs_move) * math.sqrt(fraction)
