@@ -88,6 +88,17 @@ def create_exchange():
 
 
 def fetch_live_prices(exchange, symbols: list[str]) -> dict[str, float]:
+    # One batched request when the exchange supports it, instead of one REST
+    # round-trip per symbol (8 calls/cycle -> 1).
+    if getattr(exchange, "has", {}).get("fetchTickers"):
+        try:
+            tickers = exchange.fetch_tickers(symbols)
+            prices = {s: t["last"] for s, t in tickers.items()
+                      if s in symbols and t.get("last") is not None}
+            if prices:
+                return prices
+        except Exception as e:
+            print(f"  Batch fetch_tickers failed, falling back to per-symbol: {e}")
     prices = {}
     for symbol in symbols:
         try:
@@ -190,7 +201,9 @@ def round_trip_cost(size: float) -> float:
 def is_prediction_fresh(prediction_ts_ms: int, now_ms: int, max_age_hours: int = MAX_PREDICTION_AGE_HOURS) -> bool:
     """True when a prediction is recent enough to trade on."""
     age_hours = (now_ms - int(prediction_ts_ms)) / 3_600_000
-    return 0 <= age_hours <= max_age_hours
+    # Small negative tolerance so a prediction stamped at candle-open isn't
+    # judged "from the future" (and suppressed) due to clock skew early in the hour.
+    return -0.05 <= age_hours <= max_age_hours
 
 
 def desired_sides(signals: pd.DataFrame) -> dict[str, str]:

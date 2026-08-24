@@ -105,7 +105,8 @@ class MoveCalibrator:
                                      out_of_bounds="clip")
             iso.fit(pred, real)
             self._iso = iso
-        except Exception:
+        except Exception as e:
+            print(f"  magnitude isotonic calibration failed, using raw predictions: {e}")
             self._iso = None
         return self
 
@@ -231,10 +232,11 @@ class MagnitudeModel:
             try:
                 self.model.fit(X_tr_s, self._fit_encode(y_tr))
                 pred = self._decode(self.model.predict(X_te_s))
-            except Exception:
+            except Exception as e:
                 # A failed neural fit must not take the whole training run
                 # down; ridge on the same features is a weak but honest
                 # volatility forecaster.
+                print(f"  magnitude neural fit failed, falling back to ridge: {e}")
                 self.model = Ridge(alpha=1.0)
                 self.fallback = True
                 self.model.fit(X_tr_s, self._fit_encode(y_tr))

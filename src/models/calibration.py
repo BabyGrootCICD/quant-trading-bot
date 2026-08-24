@@ -56,7 +56,8 @@ class ProbabilityCalibrator:
             iso = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
             iso.fit(raw, y)
             self._iso = iso
-        except Exception:
+        except Exception as e:
+            print(f"  probability calibration (isotonic) failed, using raw probs: {e}")
             self._iso = None
         return self
 
