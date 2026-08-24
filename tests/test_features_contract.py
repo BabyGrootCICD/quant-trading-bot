@@ -106,3 +106,35 @@ def test_flat_bars_are_unlabelled_not_scored_as_down():
     flat = nxt == 0
     assert flat.sum() > 0, "fixture must contain flat bars"
     assert feats["target_1h"][flat].isna().all(), "flat bars must be unlabelled"
+
+
+def test_nan_features_are_sent_as_explicit_nulls():
+    """Omitting a key on UPSERT retains the old value instead of clearing it."""
+    import src.features.engineer as eng
+
+    captured = {}
+
+    class FakeTable:
+        def upsert(self, batch, on_conflict=None):
+            captured["batch"] = batch
+            return self
+
+        def execute(self):
+            return type("Resp", (), {"data": []})()
+
+    class FakeClient:
+        def table(self, name):
+            return FakeTable()
+
+    feats = engineer_features(_synthetic_candles(80))
+    eng.upsert_features(FakeClient(), "BTC/USDT", feats)
+
+    batch = captured["batch"]
+    # Warm-up rows have NaN indicators; those keys must be present and null.
+    first = batch[0]
+    assert "atr_14" in first, "NaN column must still be sent"
+    assert first["atr_14"] is None, "NaN must become an explicit null"
+
+    # And every record in the batch must carry identical keys.
+    key_sets = {frozenset(r.keys()) for r in batch}
+    assert len(key_sets) == 1, "PostgREST requires uniform keys across a batch"

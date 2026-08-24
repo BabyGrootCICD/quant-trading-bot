@@ -374,20 +374,25 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
     equity = cash_balance + positions_value
     total_asset_usd = equity
 
-    # Statistics describe the current system, not the frozen-signal era.
+    # total_pnl and total_trades are accounting facts and stay lifetime, so they
+    # reconcile with equity. sharpe_ratio and win_rate are quality measures of
+    # the *strategy*, and the 75 frozen-signal trades are not this strategy --
+    # those reset at the epoch.
+    lifetime_pnl = []
+    if not trade_history.empty and "pnl" in trade_history.columns:
+        lifetime_pnl = trade_history["pnl"].dropna().tolist()
+
+    total_pnl = sum(lifetime_pnl) if lifetime_pnl else 0.0
+    total_trades = len(lifetime_pnl)
+
     stats_history = filter_to_stats_epoch(trade_history)
-
     closed_pnl = []
-    closed_sizes = []
     if not stats_history.empty and "pnl" in stats_history.columns:
-        hist = stats_history.dropna(subset=["pnl"])
-        closed_pnl = hist["pnl"].tolist()
-        closed_sizes = hist["size"].tolist() if "size" in hist.columns else []
+        closed_pnl = stats_history["pnl"].dropna().tolist()
 
-    total_pnl = sum(closed_pnl) if closed_pnl else 0.0
     wr = win_rate(closed_pnl)
-    total_trades = len(closed_pnl)
     sr = compute_sharpe(stats_history)
+    scored_trades = len(closed_pnl)
 
     client.table("portfolio").insert({
         "timestamp": now_ms,
@@ -401,7 +406,9 @@ def update_portfolio(client, cash: float, open_trades: pd.DataFrame, prices: dic
         "total_trades": total_trades,
     }).execute()
 
-    return {"equity": equity, "cash": cash_balance, "sharpe": sr, "win_rate": wr, "total_pnl": total_pnl, "total_trades": total_trades, "total_asset_usd": total_asset_usd}
+    return {"equity": equity, "cash": cash_balance, "sharpe": sr, "win_rate": wr,
+            "total_pnl": total_pnl, "total_trades": total_trades,
+            "scored_trades": scored_trades, "total_asset_usd": total_asset_usd}
 
 
 def main():
@@ -491,7 +498,11 @@ def main():
     print(f"  Total P&L: ${portfolio['total_pnl']:.2f}")
     print(f"  Sharpe: {portfolio['sharpe']:.4f}")
     print(f"  Win Rate: {portfolio['win_rate']:.2%}")
-    print(f"  Total Trades: {portfolio['total_trades']}")
+    print(f"  Total Trades: {portfolio['total_trades']} "
+          f"(scored since epoch: {portfolio['scored_trades']})")
+    if portfolio["scored_trades"] == 0:
+        print("  No trades closed since the stats epoch yet -- "
+              "sharpe/win_rate stay 0 until the first post-fix trade closes.")
 
     print("\n" + "=" * 60)
     print("Paper trading cycle complete.")

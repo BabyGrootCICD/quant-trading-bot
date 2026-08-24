@@ -195,13 +195,12 @@ def upsert_features(client, symbol: str, features: pd.DataFrame) -> int:
     records = features.to_dict(orient="records")
     clean_records = []
     for r in records:
-        rec = {}
-        for k, v in r.items():
-            if k == "id":
-                continue
-            cleaned = _clean_value(v)
-            if cleaned is not None:
-                rec[k] = cleaned
+        # Send NULL explicitly rather than omitting the key. On an UPSERT an
+        # omitted key leaves the existing column value in place, so newly
+        # unlabelled flat bars kept their old target_1h = 0 and TRX's class
+        # balance never actually changed. Explicit keys also keep every record
+        # in a batch structurally identical, which PostgREST requires.
+        rec = {k: _clean_value(v) for k, v in r.items() if k != "id"}
         clean_records.append(rec)
 
     if not clean_records:
