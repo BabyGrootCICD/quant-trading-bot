@@ -9,3 +9,4 @@ src/models/checkpoints/
 
 # Claude Code local workspace
 .claude/
+.env.local
