@@ -205,3 +205,67 @@ def test_bootstrap_schema_has_the_one_open_per_symbol_guard():
         "the same index here, a freshly provisioned database silently allows "
         "the duplicates the engine relies on the database to reject."
     )
+
+
+# --- only the tail is rewritten each run -----------------------------------
+#
+# The engineer recomputed every row and upserted all of them: ~17.5k rows per
+# symbol per hour, the slowest step in the pipeline, and it scales with the
+# size of the universe. Widening the universe from 8 to 24 symbols to raise
+# trade frequency would have taken the features step from ~6 minutes to ~18.
+
+from src.features.engineer import rows_needing_write
+
+HOUR_MS = 3_600_000
+
+
+def _features(n):
+    return pd.DataFrame({"timestamp": [i * HOUR_MS for i in range(n)],
+                         "symbol": ["BTC/USDT"] * n})
+
+
+def test_a_fresh_symbol_gets_the_full_backfill():
+    f = _features(1000)
+    assert len(rows_needing_write(f, None)) == 1000
+
+
+def test_an_established_symbol_only_rewrites_the_tail():
+    f = _features(1000)
+    pending = rows_needing_write(f, latest_ts=999 * HOUR_MS, overlap_bars=48)
+    assert len(pending) == 49          # the newest bar plus 48 of overlap
+    assert pending["timestamp"].max() == 999 * HOUR_MS
+
+
+def test_the_overlap_covers_the_forward_looking_labels():
+    """Which rows can actually change is a narrower set than it first looks.
+
+    Every feature is a *backward* rolling window, so once a bar has closed its
+    feature values are final -- a new bar arriving cannot alter them. The rows
+    that do change are the ones whose label reaches forward: `target_1h` needs
+    bar T+1 and `target_4h` needs T+4, so the last four rows are still filling
+    in. The overlap only has to cover that, and 48 bars covers it an order of
+    magnitude over.
+    """
+    forward_looking = 4                 # target_4h is the deepest shift(-n)
+    f = _features(1000)
+    pending = rows_needing_write(f, latest_ts=999 * HOUR_MS)
+    assert len(pending) > forward_looking * 2
+
+
+def test_settled_rows_are_not_rewritten():
+    """The whole point: a bar from last week cannot have changed, so writing it
+    again every hour is pure cost."""
+    f = _features(1000)
+    pending = rows_needing_write(f, latest_ts=999 * HOUR_MS)
+    assert pending["timestamp"].min() > 900 * HOUR_MS
+    assert len(pending) < 100
+
+
+def test_nothing_computed_means_nothing_written():
+    assert rows_needing_write(pd.DataFrame(), None).empty
+
+
+def test_the_newest_bar_is_always_included():
+    f = _features(1000)
+    pending = rows_needing_write(f, latest_ts=998 * HOUR_MS)
+    assert 999 * HOUR_MS in set(pending["timestamp"])

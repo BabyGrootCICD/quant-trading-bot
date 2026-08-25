@@ -19,6 +19,28 @@ def create_exchange():
     return exchange_class({"enableRateLimit": True})
 
 
+def available_symbols(exchange, symbols: list[str]) -> list[str]:
+    """The subset of `symbols` the exchange actually lists.
+
+    The universe is deliberately wider than the venue is guaranteed to carry --
+    trade frequency scales with it -- so a pair that is unlisted, delisted or
+    named differently here must degrade quietly rather than take the run down.
+    Anything dropped still flows through the rest of the pipeline as "no
+    candles", which every downstream stage already tolerates.
+    """
+    try:
+        markets = exchange.load_markets()
+    except Exception as e:
+        print(f"  Could not load markets ({e}); attempting all {len(symbols)} symbols")
+        return list(symbols)
+
+    listed = [s for s in symbols if s in markets]
+    missing = [s for s in symbols if s not in markets]
+    if missing:
+        print(f"  Not listed on {EXCHANGE_ID}, skipping {len(missing)}: {', '.join(missing)}")
+    return listed
+
+
 def fetch_ohlcv_all(exchange, symbol: str, timeframe: str, since_ms: int) -> list[list]:
     all_candles = []
     while True:
@@ -143,11 +165,13 @@ def main():
     print(f"Exchange: {EXCHANGE_ID}")
     print("=" * 60)
     exchange = create_exchange()
-    exchange.load_markets()
     client = get_client()
 
+    symbols = available_symbols(exchange, SYMBOLS)
+    print(f"  Universe: {len(symbols)}/{len(SYMBOLS)} symbols")
+
     total = 0
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         try:
             count = fetch_and_store(exchange, client, symbol)
             total += count

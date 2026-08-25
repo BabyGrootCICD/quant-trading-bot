@@ -204,6 +204,44 @@ def _clean_value(v, column: str | None = None):
     return v
 
 
+def latest_feature_timestamp(client, symbol: str) -> int | None:
+    """Newest feature row already stored for `symbol`, or None."""
+    try:
+        resp = (
+            client.table("features")
+            .select("timestamp")
+            .eq("symbol", symbol)
+            .order("timestamp", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+    if not resp.data:
+        return None
+    return int(resp.data[0]["timestamp"])
+
+
+def rows_needing_write(features: pd.DataFrame, latest_ts: int | None,
+                       overlap_bars: int = 48, bar_ms: int = 3_600_000) -> pd.DataFrame:
+    """The tail that actually changed, not the whole two-year history.
+
+    The engineer recomputes every row each run and used to upsert all of them:
+    ~17.5k rows per symbol per hour, which is the single slowest step in the
+    pipeline and scales with the size of the universe. Only the recent rows can
+    differ -- the newest bar is new, and the handful before it can shift as
+    rolling windows take in that bar (and `target_1h` fills in once the next
+    bar closes). An overlap of 48 bars covers every window in FEATURE_COLS with
+    room to spare.
+
+    A symbol with no stored features gets the full backfill.
+    """
+    if latest_ts is None or features.empty:
+        return features
+    cutoff = latest_ts - overlap_bars * bar_ms
+    return features[features["timestamp"] >= cutoff]
+
+
 def upsert_features(client, symbol: str, features: pd.DataFrame) -> int:
     if features.empty:
         return 0
@@ -238,8 +276,11 @@ def process_symbol(client, symbol: str) -> int:
         return 0
     df["symbol"] = symbol
     features = engineer_features(df)
-    count = upsert_features(client, symbol, features)
-    print(f"  {symbol}: {count} feature rows ({len(features.columns)} features)")
+    pending = rows_needing_write(features, latest_feature_timestamp(client, symbol))
+    count = upsert_features(client, symbol, pending)
+    note = "" if len(pending) == len(features) else f" of {len(features)} computed"
+    print(f"  {symbol}: {count} feature rows written{note} "
+          f"({len(features.columns)} features)")
     return count
 
 

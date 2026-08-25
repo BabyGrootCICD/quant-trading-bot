@@ -32,9 +32,29 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binanceus")
 
+# The EV gate fires on about 0.64% of bars at maker cost -- measured, not
+# assumed (notebooks/backtest_gate.py, 4068 out-of-sample bars). Trade
+# frequency is therefore linear in the size of the universe:
+#
+#     8 symbols  -> one trade every ~20h
+#    24 symbols  -> one trade every ~6.5h
+#
+# Widening it is the only way to get more trades without lowering the bar. It
+# does not change what qualifies -- every symbol faces the identical EV test --
+# it just stops the book waiting on eight coins to produce a volatile bar.
+#
+# Anything the configured exchange does not list is dropped at fetch time with
+# a log line (see fetcher.available_symbols), so an unlisted or delisted pair
+# degrades to "no candles" rather than failing the run.
 SYMBOLS = [
+    # the original eight
     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
     "XRP/USDT", "ADA/USDT", "DOGE/USDT", "TRX/USDT",
+    # liquid majors and large caps
+    "LTC/USDT", "LINK/USDT", "AVAX/USDT", "DOT/USDT",
+    "BCH/USDT", "ETC/USDT", "UNI/USDT", "ATOM/USDT",
+    "NEAR/USDT", "ALGO/USDT", "HBAR/USDT", "VET/USDT",
+    "FIL/USDT", "AAVE/USDT", "XLM/USDT", "XTZ/USDT",
 ]
 
 TIMEFRAME = "1h"
