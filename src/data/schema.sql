@@ -125,7 +125,18 @@ CREATE TABLE IF NOT EXISTS model_metrics (
     sharpe_ratio DOUBLE PRECISION,
     total_trades INT,
     win_rate DOUBLE PRECISION,
-    avg_pnl_per_trade DOUBLE PRECISION
+    avg_pnl_per_trade DOUBLE PRECISION,
+    -- The honest skill record (migration 007). accuracy alone is meaningless
+    -- without the baseline beside it, and roc_auc is the only one of these a
+    -- calibration artifact cannot move.
+    symbol VARCHAR(20),
+    up_rate DOUBLE PRECISION,
+    majority_baseline DOUBLE PRECISION,
+    balanced_accuracy DOUBLE PRECISION,
+    edge_over_baseline DOUBLE PRECISION,
+    roc_auc DOUBLE PRECISION,
+    calibration_error DOUBLE PRECISION,
+    oos_rows INT
 );
 
 -- Enable RLS on all tables

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import precision_score, recall_score, f1_score
@@ -36,6 +37,18 @@ class XGBoostModel:
         )
         self.scaler = StandardScaler()
         self.calibrator = ProbabilityCalibrator()
+        # One (scaler, model) per walk-forward fold. `predict()` averages over
+        # all of them instead of using only the last fold's fit.
+        #
+        # Keeping just the final fold made the served model depend on where the
+        # last split happened to land. The pipeline retrains from scratch every
+        # run, so each run shifts the fold boundaries by an hour and can serve a
+        # materially different model -- measured on live predictions, the
+        # directional call reversed on 29.9% of consecutive hours, and each
+        # reversal on an open position pays a full round trip. That churn is
+        # the bleed. Averaging the folds also matches the calibrator, which is
+        # already fitted on the pooled out-of-sample predictions of *all* folds.
+        self.fold_models = []
         self.is_fitted = False
 
     def fit(self, df: pd.DataFrame) -> dict:
@@ -101,19 +114,27 @@ class XGBoostModel:
         all_probas = []
         all_y_true = []
 
+        self.fold_models = []
         for train_idx, test_idx in tscv.split(X):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
-            X_train_scaled = self.scaler.fit_transform(X_train)
-            X_test_scaled = self.scaler.transform(X_test)
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
 
-            self.model.fit(X_train_scaled, y_train)
+            model = clone(self.model)
+            model.fit(X_train_scaled, y_train)
+            self.fold_models.append((scaler, model))
 
-            all_preds.extend(self.model.predict(X_test_scaled))
-            all_probas.extend(self.model.predict_proba(X_test_scaled)[:, 1])
+            all_preds.extend(model.predict(X_test_scaled))
+            all_probas.extend(model.predict_proba(X_test_scaled)[:, 1])
             all_y_true.extend(y_test)
 
+        # Keep the last fold's objects so `self.model` / `self.scaler` stay
+        # meaningful for feature_importances_ and for anything that pickled the
+        # old shape.
+        self.scaler, self.model = self.fold_models[-1]
         self.is_fitted = True
 
         all_preds = np.array(all_preds)
@@ -159,6 +180,15 @@ class XGBoostModel:
             "calibration_rows": self.calibrator.n_rows,
         }
 
+    def _raw_proba(self, X_clean):
+        """Mean predicted probability across the walk-forward folds."""
+        if not self.fold_models:
+            return self.model.predict_proba(self.scaler.transform(X_clean))[:, 1]
+        return np.mean(
+            [m.predict_proba(s.transform(X_clean))[:, 1] for s, m in self.fold_models],
+            axis=0,
+        )
+
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self.is_fitted:
             raise RuntimeError("Model not fitted. Call fit() first.")
@@ -168,8 +198,8 @@ class XGBoostModel:
         X_clean = X.copy()
         X_clean[~mask] = 0
 
-        X_scaled = self.scaler.transform(X_clean)
-        proba = self.calibrator.transform(self.model.predict_proba(X_scaled)[:, 1])
+        raw = self._raw_proba(X_clean)
+        proba = self.calibrator.transform(raw)
         preds = (proba > 0.5).astype(float)
 
         result = df[["symbol", "timestamp"]].copy()
@@ -184,7 +214,8 @@ class XGBoostModel:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump({"model": self.model, "scaler": self.scaler,
-                         "calibrator": self.calibrator}, f)
+                         "calibrator": self.calibrator,
+                         "fold_models": self.fold_models}, f)
 
     def load(self, path: Path | None = None):
         path = path or MODEL_DIR / f"{self.name}.pkl"
@@ -193,4 +224,5 @@ class XGBoostModel:
         self.model = data["model"]
         self.scaler = data["scaler"]
         self.calibrator = data.get("calibrator", ProbabilityCalibrator())
+        self.fold_models = data.get("fold_models", [])
         self.is_fitted = True

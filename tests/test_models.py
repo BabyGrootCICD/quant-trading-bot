@@ -129,3 +129,71 @@ def test_the_registry_can_build_every_model_it_lists():
         if cls is XGBoostModel and not HAS_XGBOOST:
             continue
         assert isinstance(get_model(name), cls)
+
+
+# --- the served model is the fold ensemble, not the last fold ---------------
+#
+# `fit_walk_forward` refit `self.model` per fold and left the final fold's
+# object behind, so what got served depended on where the last split landed.
+# The pipeline retrains from scratch every run, shifting the boundaries by an
+# hour each time, and live predictions reversed direction on 29.9% of
+# consecutive hours. Every reversal on an open position pays a round trip --
+# the VET/USDT trade opened and closed at 0.005825, held 12 minutes, and lost
+# exactly the fee. Replaying hourly retrains, averaging the folds cut the
+# reversal rate from 10.9% to 2.2%.
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_every_fold_is_kept_not_just_the_last(model_cls):
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=5)
+    assert len(model.fold_models) >= 4
+    for scaler, inner in model.fold_models:
+        assert hasattr(inner, "predict_proba")
+        assert hasattr(scaler, "transform")
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_folds_are_independent_fits_not_the_same_object(model_cls):
+    """They were the same object refit in a loop, so only the last survived."""
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=5)
+    ids = {id(m) for _s, m in model.fold_models}
+    assert len(ids) == len(model.fold_models)
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_the_prediction_averages_the_folds(model_cls):
+    import numpy as np
+
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=5)
+
+    df = _training_frame(1200)
+    X = df[FEATURE_COLS].to_numpy(float)
+    per_fold = np.array([m.predict_proba(s.transform(X))[:, 1]
+                         for s, m in model.fold_models])
+    assert model._raw_proba(X) == pytest.approx(per_fold.mean(axis=0))
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_the_ensemble_is_steadier_than_any_single_fold(model_cls):
+    """Averaging cuts variance -- that is the entire point, and it is what
+    stops the served opinion flipping between hourly retrains."""
+    import numpy as np
+
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1500), n_splits=5)
+    X = _training_frame(1500)[FEATURE_COLS].to_numpy(float)
+
+    per_fold = np.array([m.predict_proba(s.transform(X))[:, 1]
+                         for s, m in model.fold_models])
+    assert model._raw_proba(X).std() <= per_fold.std(axis=1).mean() + 1e-9
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_a_checkpoint_without_folds_still_predicts(model_cls):
+    """Pickles written before this change carry no fold_models."""
+    model = model_cls()
+    model.fit_walk_forward(_training_frame(1200), n_splits=5)
+    model.fold_models = []
+    assert model.predict(_training_frame(1200))["probability_up"].notna().any()

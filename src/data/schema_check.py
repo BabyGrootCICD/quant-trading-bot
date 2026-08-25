@@ -30,6 +30,17 @@ REQUIRED_COLUMNS = {
 }
 
 
+# Columns the pipeline can run without. Losing them costs visibility, not
+# correctness: `check_auto_upgrade()` degrades to "keep the current model" and
+# `log_model_metrics()` falls back to the legacy subset. Failing the run over
+# them would stop trading to protect a diagnostic, which is the wrong trade --
+# a strict preflight on `scored_trades` already cost one red pipeline.
+ADVISORY_COLUMNS = {
+    "model_metrics": ["symbol", "up_rate", "majority_baseline", "balanced_accuracy",
+                      "edge_over_baseline", "roc_auc", "calibration_error", "oos_rows"],
+}
+
+
 def missing_columns(client, table: str, required: list[str]) -> list[str]:
     """Columns in `required` that the live table does not expose.
 
@@ -63,7 +74,21 @@ def main():
     print("Quant Bot - Schema Preflight")
     print("=" * 60)
 
-    problems = check(get_client())
+    client = get_client()
+
+    advisory = {}
+    for table, cols in ADVISORY_COLUMNS.items():
+        gap = missing_columns(client, table, cols)
+        if gap:
+            advisory[table] = gap
+
+    problems = check(client)
+
+    for table, gap in advisory.items():
+        print(f"  ADVISORY: '{table}' is missing {', '.join(gap)}")
+        print("            The run continues; model-quality history and the")
+        print("            promotion ladder stay disabled until migration 007")
+        print("            is applied.")
 
     if not problems:
         print("  Schema OK: all required columns present.")

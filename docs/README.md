@@ -17,6 +17,7 @@ Read them in order; each builds on the one before.
 | 07 | [Why no trades](07-why-no-trades.md) | The measurement everything hinges on: no directional edge survives its own error bar at any horizon, so zero trades is the correct output |
 | 08 | [The forming bar](08-forming-bar.md) | The traded prediction was computed from a bar that had not finished — volume features at the 0th percentile of anything the model was trained on |
 | 09 | [Firing on artifacts](09-the-gate-was-firing-on-artifacts.md) | The gate was never blocked — it fires ~1 bar in 256 and lost 0.34%/trade, because isotonic calibration handed it three-sample blocks as certainties |
+| 10 | [Model generation](10-model-generation.md) | Only the last walk-forward fold was ever served, so the model reversed itself on 29.9% of hours and paid a round trip each time; every honest skill metric was computed then discarded |
 
 ## The one-paragraph version
 

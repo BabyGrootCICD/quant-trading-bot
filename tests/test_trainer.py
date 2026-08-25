@@ -337,3 +337,81 @@ def test_noise_level_edge_does_not_promote():
 def test_one_good_run_is_not_a_track_record():
     rows = _metrics_rows(trainer.LOGISTIC_MODEL_NAME, 0.05, n=3)
     assert trainer.check_auto_upgrade(_MetricsClient(rows)) == trainer.LOGISTIC_MODEL_NAME
+
+
+# --- the skill record must actually be recorded ----------------------------
+
+def test_the_honest_skill_metrics_are_persisted():
+    """They were all computed and then dropped on the floor, which left
+    check_auto_upgrade() gating on a column that did not exist."""
+    client = FakeClient()
+    trainer.log_model_metrics(client, {
+        "model_name": "xgboost_v1", "symbol": "BTC/USDT", "test_accuracy": 0.53,
+        "up_rate": 0.51, "majority_baseline": 0.51, "balanced_accuracy": 0.529,
+        "edge_over_baseline": 0.019, "roc_auc": 0.5547,
+        "calibration_error": 0.0, "test_rows": 4065, "ev": 0.06,
+    })
+    row = [c for c in client.calls if c[0] == "model_metrics"][0][2]
+    for k in ("edge_over_baseline", "roc_auc", "balanced_accuracy",
+              "majority_baseline", "up_rate", "symbol"):
+        assert row.get(k) is not None, f"{k} was dropped"
+    assert row["edge_over_baseline"] == pytest.approx(0.019)
+
+
+def test_the_promotion_gate_reads_a_column_that_is_written():
+    """The gate and the writer must agree, or the ladder is dead code."""
+    import inspect
+
+    written = set()
+    src = inspect.getsource(trainer.log_model_metrics)
+    for line in src.splitlines():
+        line = line.strip()
+        if line.startswith('"') and '":' in line:
+            written.add(line.split('"')[1])
+    gate = inspect.getsource(trainer.check_auto_upgrade)
+    assert "edge_over_baseline" in gate
+    assert "edge_over_baseline" in written, "gate reads a field nobody writes"
+
+
+def test_misleading_trading_shaped_metrics_are_no_longer_written():
+    """model_metrics.sharpe_ratio was +1/-1 per out-of-sample call annualised
+    at sqrt(8760) -- it read 10.66 for a model with 1.5pp of edge -- and
+    win_rate was byte-identical to accuracy. Both looked like trading results
+    and were not."""
+    client = FakeClient()
+    trainer.log_model_metrics(client, {"model_name": "x", "test_accuracy": 0.5,
+                                       "sharpe": 10.66, "win_rate": 0.53})
+    row = [c for c in client.calls if c[0] == "model_metrics"][0][2]
+    assert "sharpe_ratio" not in row
+    assert "win_rate" not in row
+
+
+def test_a_missing_migration_does_not_stop_the_bot_trading():
+    """The skill record is diagnostic. A strict preflight on `scored_trades`
+    already cost one red pipeline; losing model-quality history must not stop
+    the book."""
+    class _Rejects(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def table(self, name):
+            outer = self
+
+            class _T:
+                def insert(_s, payload):
+                    outer.attempts += 1
+                    if outer.attempts == 1 and "roc_auc" in payload:
+                        raise Exception("PGRST204 Could not find the 'roc_auc' column")
+                    return FakeTable(outer.calls, name).insert(payload)
+            return _T()
+
+    client = _Rejects()
+    trainer.log_model_metrics(client, {
+        "model_name": "xgboost_v1", "test_accuracy": 0.53, "roc_auc": 0.55,
+        "edge_over_baseline": 0.02, "ev": 0.06, "total_signals": 100,
+    })
+    logged = [c for c in client.calls if c[0] == "model_metrics"]
+    assert len(logged) == 1, "must fall back, not give up"
+    assert "roc_auc" not in logged[0][2]
+    assert logged[0][2]["model_name"] == "xgboost_v1"

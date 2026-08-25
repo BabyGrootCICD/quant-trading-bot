@@ -122,12 +122,26 @@ def skill_metrics(metrics: dict) -> dict:
             recalls.append(sum(1 for i in actual if preds[i] == cls) / len(actual))
     balanced = sum(recalls) / len(recalls) if recalls else 0.0
 
-    return {
+    out = {
         "up_rate": round(up_rate, 4),
         "majority_baseline": round(baseline, 4),
         "balanced_accuracy": round(balanced, 4),
         "edge_over_baseline": round(accuracy - baseline, 4),
     }
+
+    # AUC is invariant under any monotone transform, so it measures the model's
+    # discrimination *before* calibration can flatten or inflate it. Accuracy
+    # cannot do that job: it moves with the decision threshold and with class
+    # skew, which is how TRX's 0.65 on a 0.64 baseline once looked like skill.
+    probas = metrics.get("oos_probas")
+    if probas and len(probas) == n and len(set(y_true)) > 1:
+        try:
+            from sklearn.metrics import roc_auc_score
+
+            out["roc_auc"] = round(float(roc_auc_score(y_true, probas)), 4)
+        except Exception:
+            pass
+    return out
 
 
 def out_of_sample_pnl(metrics: dict) -> list[float]:
@@ -315,18 +329,57 @@ def train_and_evaluate(client, symbol: str, model) -> dict:
 
 
 def log_model_metrics(client, metrics: dict):
+    """Persist what the run actually learned about the model.
+
+    Everything `skill_metrics()` computes used to be thrown away here, which
+    left `check_auto_upgrade()` gating on a column that did not exist -- the
+    promotion ladder has never been able to fire -- and left no record of
+    whether any model had skill.
+
+    `sharpe_ratio` and `win_rate` are deliberately no longer written from the
+    old per-prediction series. They were computed over +1/-1 per out-of-sample
+    call annualised at sqrt(8760), which produced numbers like 10.66 for a
+    model carrying 1.5pp of edge, and `win_rate` was byte-identical to
+    `accuracy` because a "win" was just a correct call. Both read as trading
+    results and are not; the portfolio table is where trading results live.
+    """
     if "error" in metrics:
         return
-    client.table("model_metrics").insert({
+
+    row = {
         "model_name": metrics.get("model_name", "unknown"),
+        "symbol": metrics.get("symbol"),
         "accuracy": metrics.get("test_accuracy"),
         "precision_up": metrics.get("expected_value_long"),
         "recall_up": metrics.get("expected_value_short"),
         "expected_value": metrics.get("ev"),
-        "sharpe_ratio": metrics.get("sharpe"),
         "total_trades": metrics.get("total_signals"),
-        "win_rate": metrics.get("win_rate"),
-    }).execute()
+        # the honest skill record
+        "up_rate": metrics.get("up_rate"),
+        "majority_baseline": metrics.get("majority_baseline"),
+        "balanced_accuracy": metrics.get("balanced_accuracy"),
+        "edge_over_baseline": metrics.get("edge_over_baseline"),
+        "roc_auc": metrics.get("roc_auc"),
+        "calibration_error": metrics.get("calibration_error"),
+        "oos_rows": metrics.get("test_rows"),
+    }
+
+    try:
+        client.table("model_metrics").insert(row).execute()
+    except Exception as e:
+        # Migration 007 not applied yet. Losing the skill record must not stop
+        # the bot trading, so fall back to the columns that have always
+        # existed -- loudly, because the promotion ladder stays blind until
+        # someone applies it.
+        legacy = {k: row[k] for k in ("model_name", "accuracy", "precision_up",
+                                      "recall_up", "expected_value", "total_trades")
+                  if k in row}
+        print(f"  WARNING: full metrics rejected ({str(e)[:90]}); "
+              "logged legacy columns only -- apply migration 007")
+        try:
+            client.table("model_metrics").insert(legacy).execute()
+        except Exception as e2:
+            print(f"  WARNING: metrics not logged at all ({str(e2)[:90]})")
 
 
 def check_auto_upgrade(client) -> str:

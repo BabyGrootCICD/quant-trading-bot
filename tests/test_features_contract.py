@@ -189,7 +189,8 @@ def test_float_features_stay_floats():
 def test_bootstrap_schema_has_every_migrated_column():
     added = _migration_columns()
     bootstrap = set()
-    for table in ("features", "predictions", "paper_trades", "portfolio"):
+    for table in ("features", "predictions", "paper_trades", "portfolio",
+                  "model_metrics"):
         bootstrap |= _schema_columns(table)
     missing = sorted(added - bootstrap)
     assert not missing, (
