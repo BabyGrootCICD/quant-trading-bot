@@ -316,3 +316,97 @@ def test_predictions_go_through_the_calibrator():
     # A monotone map cannot produce a forecast above the largest realised move
     # it was ever fitted against, which is the whole point.
     assert model.predict(df).max() <= df["target_move_1h"].max()
+
+
+# --- the direction head had the magnitude head's disease ---------------------
+#
+# MoveCalibrator was fixed for tail overfitting; ProbabilityCalibrator was not
+# even checked. Isotonic is a step function over pooled-adjacent blocks, and at
+# the extremes those blocks are tiny -- live output included exactly 0.333 and
+# 0.667, i.e. blocks of three observations, handed to the EV gate as fact.
+#
+# Selection points the same way: the gate only ever fires on the most extreme
+# probabilities, which are exactly the least-supported blocks. Backtested over
+# 4068 out-of-sample bars, the isotonic-calibrated gate fired on 0.39% of bars
+# and lost 0.34% per trade at a 37.5% win rate. With sigmoid it fires on none
+# of them, and max strength falls from 0.990 to 0.652 -- which matches the
+# observed top-decile up-rate of the best symbol (0.6435).
+
+def _weak_signal(n=3000, seed=11):
+    """A model with a little real skill and a wide spread of raw scores.
+
+    Shaped like the real thing: xgboost emits confident-looking raw
+    probabilities (live range 0.029-0.992) even when its actual discrimination
+    is AUC 0.53, so the extremes are populated but *sparsely*.
+    """
+    rng = np.random.default_rng(seed)
+    raw = rng.uniform(0.03, 0.97, size=n)
+    # Barely-there signal: the score shifts the odds by a couple of points.
+    y = (rng.uniform(size=n) < 0.5 + 0.06 * (raw - 0.5)).astype(int)
+    return raw, y
+
+
+def test_isotonic_manufactures_confidence_from_thin_blocks():
+    """Documents the defect precisely, so the fix cannot be silently reverted.
+
+    The mechanism is not randomness, it is arithmetic: isotonic's fitted value
+    for the topmost block is the *mean of that block*. When the block holds
+    three observations that happen to be up, the answer is 1.0 (clipped to
+    0.99); when it holds two of three, the answer is exactly 0.667. Both were
+    observed live. Neither is a probability estimated from data.
+    """
+    raw, y = _weak_signal()
+    # The handful of highest-scoring bars happen to have gone up -- routine.
+    raw = np.append(raw, [0.980, 0.985, 0.990])
+    y = np.append(y, [1, 1, 1])
+
+    iso = ProbabilityCalibrator(method="isotonic").fit(raw, y).transform(raw)
+    sig = ProbabilityCalibrator(method="sigmoid").fit(raw, y).transform(raw)
+
+    assert iso.max() > 0.90, "isotonic claims near-certainty from three bars"
+    assert sig.max() < 0.75, "sigmoid cannot be moved that far by three bars"
+
+
+def test_sigmoid_will_not_claim_more_than_the_data_supports():
+    raw, y = _weak_signal()
+    sig = ProbabilityCalibrator(method="sigmoid").fit(raw, y).transform(raw)
+    assert sig.max() < 0.75
+    assert sig.min() > 0.25
+
+
+def test_the_calibrated_ceiling_tracks_the_observed_top_decile():
+    """The honest ceiling: bars the model ranks highest actually go up this
+    often, so no calibrated probability should exceed it by much."""
+    raw, y = _weak_signal()
+    top = raw >= np.quantile(raw, 0.9)
+    observed = y[top].mean()
+    sig = ProbabilityCalibrator(method="sigmoid").fit(raw, y).transform(raw)
+    assert sig.max() < observed + 0.15
+
+
+def test_sigmoid_is_monotone_so_it_cannot_destroy_ranking():
+    """Calibration must fix the level, never the ordering -- the ordering is
+    the only thing the model actually knows."""
+    from sklearn.metrics import roc_auc_score
+
+    raw, y = _weak_signal()
+    sig = ProbabilityCalibrator(method="sigmoid").fit(raw, y).transform(raw)
+    assert roc_auc_score(y, sig) == pytest.approx(roc_auc_score(y, raw), abs=1e-9)
+
+
+def test_sigmoid_still_improves_calibration():
+    raw, y = _weak_signal()
+    sig = ProbabilityCalibrator(method="sigmoid").fit(raw, y).transform(raw)
+    assert calibration_error(sig, y) < calibration_error(raw, y)
+
+
+def test_the_gate_refuses_a_thin_block_masquerading_as_certainty():
+    """End to end: a 0.99 from a three-sample block clears any realistic gate."""
+    from src.strategy.economics import is_tradeable
+
+    assert is_tradeable(0.99, 0.004), "the artifact would have opened a position"
+    assert not is_tradeable(0.652, 0.004), "the honest ceiling does not"
+
+
+def test_default_method_is_sigmoid():
+    assert ProbabilityCalibrator().method == "sigmoid"

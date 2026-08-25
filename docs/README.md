@@ -16,6 +16,7 @@ Read them in order; each builds on the one before.
 | 06 | [EV allocation](06-ev-allocation.md) | Why "correctly refuses to trade" became "never trades and never exits", and the magnitude head, calibration, exit policy and Kelly allocator that fix it |
 | 07 | [Why no trades](07-why-no-trades.md) | The measurement everything hinges on: no directional edge survives its own error bar at any horizon, so zero trades is the correct output |
 | 08 | [The forming bar](08-forming-bar.md) | The traded prediction was computed from a bar that had not finished — volume features at the 0th percentile of anything the model was trained on |
+| 09 | [Firing on artifacts](09-the-gate-was-firing-on-artifacts.md) | The gate was never blocked — it fires ~1 bar in 256 and lost 0.34%/trade, because isotonic calibration handed it three-sample blocks as certainties |
 
 ## The one-paragraph version
 
