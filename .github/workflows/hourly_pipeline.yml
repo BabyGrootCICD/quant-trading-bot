@@ -9,21 +9,6 @@ concurrency:
   group: hourly-pipeline
   cancel-in-progress: false
 
-env:
-  # Strategy knobs, tunable from repo variables without a code change. Every
-  # one of these is read through config.settings.env_float/env_str, which
-  # treats an unset variable's empty string as "use the default" -- a bare
-  # float() on `vars.X` would crash the step for anyone who has not defined it.
-  EXECUTION_MODE: ${{ vars.EXECUTION_MODE }}      # taker (default) | maker
-  MIN_EDGE_MARGIN: ${{ vars.MIN_EDGE_MARGIN }}    # edge required over cost, default 1.0
-  KELLY_SCALE: ${{ vars.KELLY_SCALE }}            # fraction of Kelly, default 0.25
-  MAX_POSITION_FRAC: ${{ vars.MAX_POSITION_FRAC }}   # per symbol, default 0.10 of equity
-  MAX_GROSS_EXPOSURE: ${{ vars.MAX_GROSS_EXPOSURE }} # whole book, default 0.60 of equity
-  MAX_HOLDING_HOURS: ${{ vars.MAX_HOLDING_HOURS }}   # default 6
-  STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}           # default 0.015
-  TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}       # default 0.02
-  ACTIVE_MODEL: ${{ vars.ACTIVE_MODEL }}             # pin a model, else the promotion ladder
-
 jobs:
   pipeline:
     runs-on: ubuntu-latest
@@ -41,6 +26,12 @@ jobs:
       # anything touches the database or the book. The outage that started all
       # of this was an interface break (`fit_walk_forward` missing on the
       # promoted model) that no step ever checked for.
+      #
+      # Deliberately inherits NO strategy configuration. The knobs used to live
+      # in a job-level `env:` block, which applies to every step, so flipping
+      # EXECUTION_MODE to maker for production rewrote the economics underneath
+      # the assertions and turned 12 tests red (run #50). tests/conftest.py
+      # clears them defensively too; this keeps them out in the first place.
       - name: Unit tests
         run: pip install pytest && python -m pytest tests -q
 
@@ -68,10 +59,26 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ACTIVE_MODEL: ${{ vars.ACTIVE_MODEL }}     # pin a model, else the ladder
+          EXECUTION_MODE: ${{ vars.EXECUTION_MODE }} # only to report the cost
 
+      # Strategy knobs are scoped to the step that trades, not to the job, so
+      # they can never reach the test step. Unset variables arrive as empty
+      # strings; config.settings.env_float/env_str treat those as "use the
+      # default" rather than crashing.
       - name: Paper trade
         run: python -m src.paper_trading.engine
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EXCHANGE_ID: binanceus
+          EXECUTION_MODE: ${{ vars.EXECUTION_MODE }}         # taker (default) | maker
+          MIN_EDGE_MARGIN: ${{ vars.MIN_EDGE_MARGIN }}       # edge over cost, default 1.0
+          MIN_HORIZON_FRACTION: ${{ vars.MIN_HORIZON_FRACTION }}
+          KELLY_SCALE: ${{ vars.KELLY_SCALE }}               # default 0.25
+          MAX_POSITION_FRAC: ${{ vars.MAX_POSITION_FRAC }}   # default 0.10 of equity
+          MAX_GROSS_EXPOSURE: ${{ vars.MAX_GROSS_EXPOSURE }} # default 0.60 of equity
+          MAX_HOLDING_HOURS: ${{ vars.MAX_HOLDING_HOURS }}   # default 6
+          STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}           # default 0.015
+          TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}       # default 0.02
+          SIGNAL_EXIT_BAND: ${{ vars.SIGNAL_EXIT_BAND }}     # default 0.02
