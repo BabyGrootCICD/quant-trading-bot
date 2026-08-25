@@ -142,7 +142,16 @@ def move_volatility(expected_abs_move: float) -> float:
 # over what remains of that bar. Below this fraction the entry is refused
 # outright rather than merely priced down -- at the tail end of a bar the
 # remaining-move estimate is dominated by microstructure, not by the model.
-MIN_HORIZON_FRACTION = env_float("MIN_HORIZON_FRACTION", 0.25)
+#
+# 0.08, not the 0.25 this shipped with. `collectable_move()` already discounts
+# by sqrt(fraction), so the economics of a late entry are priced, not ignored;
+# this floor exists only to stop the sqrt model being extrapolated into the
+# last few minutes of a bar where it stops describing anything. At 0.25 it was
+# doing far more than that -- it short-circuited the entire cycle for any run
+# landing in the final quarter of an hour, and GitHub's scheduler drops runs
+# at effectively random points in the bar, so it silently discarded about a
+# quarter of every cycle's opportunities before EV was ever consulted.
+MIN_HORIZON_FRACTION = env_float("MIN_HORIZON_FRACTION", 0.08)
 
 
 def horizon_fraction(now_ms: int, bar_ms: int = 3_600_000) -> float:

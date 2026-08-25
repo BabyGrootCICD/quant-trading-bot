@@ -96,7 +96,21 @@ def test_the_boundary_sits_where_the_arithmetic_says_it_does():
 def test_nothing_opens_once_too_little_of_the_bar_is_left():
     """Below the floor the remaining-move estimate is microstructure, not
     model, so the gate stops pricing and just declines."""
-    assert _candidates(at(55), move=0.10) == [], "even a huge forecast"
+    assert _candidates(at(58), move=0.10) == [], "even a huge forecast"
+
+
+def test_the_floor_does_not_short_circuit_a_whole_quarter_of_the_hour():
+    """It shipped at 0.25, which discarded every cycle landing in the last 15
+    minutes before EV was ever consulted -- and GitHub drops runs at
+    effectively random points in the bar. `collectable_move()` already prices
+    a late entry via sqrt(fraction); the floor is only meant to stop that model
+    being extrapolated into the final minutes."""
+    from src.strategy.economics import MIN_HORIZON_FRACTION
+
+    assert MIN_HORIZON_FRACTION < 0.25
+    # 15 minutes left is priced, not vetoed.
+    assert engine.build_candidates(_signals(prob=0.90, move=0.10), PRICES,
+                                   now_ms=at(45)) != []
 
 
 def test_the_floor_is_configurable():
@@ -160,7 +174,7 @@ def test_a_late_cycle_opens_nothing_and_says_why(capsys):
         "insert": lambda _s, p: type("Q", (), {"execute": lambda _: None})()})()})()
 
     opened = engine.open_new_positions(
-        client, _signals(prob=0.75, move=0.030), PRICES, at(50),
+        client, _signals(prob=0.75, move=0.030), PRICES, at(58),
         "neural_v1", 10_000.0, held={})
 
     assert opened == []

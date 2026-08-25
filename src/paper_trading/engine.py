@@ -664,10 +664,11 @@ def build_candidates(signals: pd.DataFrame, prices: dict[str, float],
 
     fraction = 1.0 if now_ms is None else horizon_fraction(now_ms)
     if now_ms is not None and fraction < min_horizon:
-        mins_left = fraction * 60
-        print(f"  Opening nothing: only {mins_left:.0f} min of the forecast bar "
-              f"remain ({fraction:.0%} < {min_horizon:.0%} minimum). The round "
-              "trip costs the same whenever it is paid; the move does not.")
+        # Rounded percentages read as "25% < 25%" at the boundary, which looks
+        # like a bug rather than a rule; print what was actually compared.
+        print(f"  Opening nothing: {fraction*60:.1f} min of the forecast bar remain "
+              f"(fraction {fraction:.3f} below the {min_horizon:.3f} floor). Too "
+              "little of the horizon left for the sqrt(t) model to mean anything.")
         return candidates
 
     for _, row in signals.iterrows():
