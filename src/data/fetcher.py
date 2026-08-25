@@ -33,6 +33,35 @@ def fetch_ohlcv_all(exchange, symbol: str, timeframe: str, since_ms: int) -> lis
     return all_candles
 
 
+def drop_incomplete_bars(candles: list[list], now_ms: int, bar_ms: int = 3_600_000) -> list[list]:
+    """Keep only bars whose interval has fully elapsed.
+
+    Exchanges return the bar currently forming as the last element, and it was
+    being stored like any other. Everything downstream then inherited a partial
+    bar as its newest row:
+
+      * `engineer_features` computed that row's features from a fraction of an
+        hour's data. Measured against the distribution of completed bars, five
+        minutes in, `volume_ratio` and `volume_ratio_48` land at the **0th
+        percentile** -- outside anything the model saw in training. The run that
+        prompted this was 2.4 minutes in.
+      * `model.predict()` masks on NaN features, not on the NaN *target*, so
+        that row was scored, and `upsert_latest_prediction` takes the newest
+        timestamp -- making the partial bar THE traded prediction.
+      * the label is `sign(return of the NEXT bar)`, so a forecast made from
+        the forming bar is a forecast for a bar that has not started yet, while
+        `horizon_fraction()` discounts it as though it applied to the current
+        one. The two disagreed by a whole bar.
+
+    With only completed bars stored, the newest feature row is the last closed
+    bar T and its forecast is for T+1 -- the bar now forming, which is exactly
+    what the engine trades and exactly what `horizon_fraction()` measures.
+    """
+    if bar_ms <= 0:
+        return candles
+    return [c for c in candles if int(c[0]) + bar_ms <= now_ms]
+
+
 def candles_to_rows(symbol: str, candles: list[list]) -> list[dict]:
     return [
         {
@@ -96,7 +125,12 @@ def fetch_and_store(exchange, client, symbol: str) -> int:
     since = resolve_since(latest_stored_timestamp(client, symbol), backfill_start)
     print(f"  Fetching {symbol} since {datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()}...")
     candles = fetch_ohlcv_all(exchange, symbol, TIMEFRAME, since)
-    print(f"  Fetched {len(candles)} candles")
+    fetched = len(candles)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    candles = drop_incomplete_bars(candles, now_ms)
+    dropped = fetched - len(candles)
+    print(f"  Fetched {fetched} candles"
+          + (f" ({dropped} still forming, not stored)" if dropped else ""))
     rows = candles_to_rows(symbol, candles)
     upserted = upsert_candles(client, rows)
     print(f"  Upserted {upserted} rows")

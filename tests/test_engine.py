@@ -67,8 +67,18 @@ def _signals(btc=1, eth=-1):
 # --- staleness guard -------------------------------------------------------
 
 def test_stale_prediction_is_rejected():
-    three_hours_ago = NOW - 3 * 3_600_000
-    assert engine.is_prediction_fresh(three_hours_ago, NOW) is False
+    five_hours_ago = NOW - 5 * 3_600_000
+    assert engine.is_prediction_fresh(five_hours_ago, NOW) is False
+
+
+def test_a_prediction_stamped_with_the_last_complete_bar_is_still_fresh():
+    """The guard was 2h. Predictions are now stamped with the last *complete*
+    bar rather than the forming one, so a cycle running at :55 legitimately
+    reads one 1.92h old -- and GitHub's scheduler adds 47-136 minutes of drift
+    on top. At 2h those would have been rejected and the book silently
+    flattened."""
+    assert engine.is_prediction_fresh(NOW - int(1.92 * 3_600_000), NOW) is True
+    assert engine.is_prediction_fresh(NOW - int(2.8 * 3_600_000), NOW) is True
 
 
 def test_fresh_prediction_is_accepted():

@@ -32,7 +32,13 @@ INITIAL_CASH = 10000.0
 # A prediction older than this is not tradeable. Without this guard the engine
 # happily replayed one frozen prediction set for a full day, paying the
 # round-trip spread every hour on a signal carrying zero information.
-MAX_PREDICTION_AGE_HOURS = 2
+#
+# Three hours, not two. A prediction is now stamped with the last *complete*
+# bar (the fetcher no longer stores the forming one), so a cycle running at
+# :55 reads a prediction 1.92h old through no fault of anything -- and
+# GitHub's scheduler adds its own 47-136 minute drift on top. Two hours would
+# reject perfectly good predictions and silently flatten the book.
+MAX_PREDICTION_AGE_HOURS = env_float("MAX_PREDICTION_AGE_HOURS", 3)
 
 # Number of closed trades pulled for portfolio stats. The old 500 cap silently
 # truncated total_pnl and total_trades once the bot passed 500 trades.
