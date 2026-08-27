@@ -109,3 +109,4 @@ Set in GitHub Secrets:
 - `EXCHANGE_ID` — Exchange ID (default: `binanceus`)
 - `IBM_QUANTUM_TOKEN` — IBM Quantum API key (optional)
 - `IBM_QUANTUM_INSTANCE` — IBM Quantum instance CRN (optional)
+
